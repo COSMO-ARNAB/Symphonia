@@ -1,3 +1,7 @@
+# Ignore all markdown files (keep locally, do not commit)
+*.md
+**/*.md
+
 # Documentation (private/internal)
 docs/
 
