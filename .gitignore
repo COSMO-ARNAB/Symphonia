@@ -1,0 +1,10 @@
+# Documentation (private/internal)
+docs/
+
+# AI Assistant & Tool Configuration (Local only, do not push)
+AGENTS.md
+.agents/
+graphify-out/
+.codex/
+.claude/
+.graphifyignore
