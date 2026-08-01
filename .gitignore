@@ -12,3 +12,29 @@ graphify-out/
 .codex/
 .claude/
 .graphifyignore
+.opencode/
+.workbuddy-ai/
+opencode.jsonc
+
+# Build outputs & IDE files
+.gradle/
+**/build/
+**/bin/
+**/.idea/
+**/.vscode/
+*.iml
+
+# Node / JS dependencies and build artifacts
+node_modules/
+dist/
+coverage/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
