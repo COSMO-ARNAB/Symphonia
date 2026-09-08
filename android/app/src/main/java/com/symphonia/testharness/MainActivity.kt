@@ -57,7 +57,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate()
+        super.onCreate(savedInstanceState)
 
         val researcher = PackageVisibilityResearcher(this)
 
@@ -163,15 +163,16 @@ class MainActivity : ComponentActivity() {
                                 Text("Gate 1 Telemetry & Environment Metadata", style = MaterialTheme.typography.titleMedium)
                                 Text(
                                     text = if (isCaptureActive && candidateService != null) {
-                                        val snap = candidateService!!.telemetryCollector.getSnapshot()
-                                        val meta = snap.metadata
+                                        val collector = candidateService!!.telemetryCollector
+                                        val snap = collector.getLatestRecord()
+                                        val meta = collector.environmentMetadata
                                         "Device: ${meta.manufacturer} ${meta.model} (Android ${meta.androidVersion}, API ${meta.apiLevel})\n" +
                                                 "Patch: ${meta.securityPatch} | RAM: ${meta.totalRamGb} GB\n" +
                                                 "Target App: ${candidateService!!.targetAppLabel}\n" +
                                                 "Startup Latency: ${snap.startupLatencyMs} ms\n" +
                                                 "PCM Bytes: ${snap.totalBytesCaptured} | Buffers: ${snap.bufferCount}\n" +
-                                                "Route: ${snap.activeAudioOutputRoute}\n" +
-                                                "Thermal: ${snap.thermalStatus} | Memory: ${snap.memoryPressureState}"
+                                                "Route: ${snap.audioRoute}\n" +
+                                                "Thermal: ${snap.thermalStatus} | Memory: ${snap.memoryState}"
                                     } else {
                                         "Candidate Backend Idle. Run test on Physical Android Device."
                                     },

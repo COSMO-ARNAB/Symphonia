@@ -203,8 +203,12 @@ class Gate2BenchmarkTest {
         ).forEach { assertTrue("missing $it", combined.contains(it)) }
         assertTrue(combined.contains("VERIFIED_PHYSICAL_COLLECTOR"))
         assertTrue(combined.contains("collector-trial-evidence"))
+        // Metadata-only: ensure no raw audio payload fields are exported.
+        // Exclude the legitimate statistics field "sampleStandardDeviation" from the "samples" check
+        // to avoid false positives (that field is aggregated statistics, not audio).
         assertFalse(combined.contains("pcm", ignoreCase = true))
-        assertFalse(combined.contains("samples", ignoreCase = true))
+        val withoutStats = combined.replace("sampleStandardDeviation", "")
+        assertFalse(withoutStats.contains("samples", ignoreCase = true))
     }
 
     @Test(expected = IllegalArgumentException::class)

@@ -19,6 +19,7 @@ opencode.jsonc
 # Build outputs & IDE files
 .gradle/
 **/build/
+local.properties
 **/bin/
 **/.idea/
 **/.vscode/
