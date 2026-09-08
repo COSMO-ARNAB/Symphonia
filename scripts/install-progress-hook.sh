@@ -8,7 +8,10 @@
 
 set -e
 ROOT="$(git rev-parse --show-toplevel)"
-HOOK="$ROOT/.git/hooks/post-commit"
+# Respect a configured core.hooksPath (git ignores .git/hooks when set).
+HOOK_DIR="$(git config core.hooksPath || printf '%s/.git/hooks' "$ROOT")"
+mkdir -p "$HOOK_DIR"
+HOOK="$HOOK_DIR/post-commit"
 SNIPPET_FILE="$ROOT/scripts/progress-commit-log.sh"
 
 [ -f "$SNIPPET_FILE" ] || { echo "error: $SNIPPET_FILE not found"; exit 1; }
@@ -23,14 +26,18 @@ if [ -f "$HOOK" ] && grep -q "symphonia-progress-log-start" "$HOOK" 2>/dev/null;
     exit 0
 fi
 
-mkdir -p "$ROOT/.git/hooks"
+mkdir -p "$HOOK_DIR"
+# Build hook content: shebang first (git spawn requires it on line 1), then our
+# snippet, then any pre-existing content with its own shebang line stripped
+# (it would otherwise sit mid-file as a dead comment).
 if [ -f "$HOOK" ]; then
     TMP="$HOOK.tmp"
-    printf '%s\n\n' "$SNIPPET" > "$TMP"
-    cat "$HOOK" >> "$TMP"
+    printf '#!/bin/sh\n\n' > "$TMP"
+    printf '%s\n\n' "$SNIPPET" >> "$TMP"
+    tail -n +2 "$HOOK" | sed '1{/^#!/d}' >> "$TMP"
     mv "$TMP" "$HOOK"
 else
-    printf '%s\n' "$SNIPPET" > "$HOOK"
+    printf '#!/bin/sh\n\n%s\n' "$SNIPPET" > "$HOOK"
 fi
 chmod +x "$HOOK"
 echo "installed progress-log snippet into $HOOK"

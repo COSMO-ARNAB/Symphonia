@@ -8,6 +8,8 @@
 MARKER="<!-- AUTO-COMMIT-LOG -->"
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
 PROGRESS="$ROOT/progress.md"
+# Gate: only act in repos that ship this script (core.hooksPath can be global).
+[ -f "$ROOT/scripts/progress-commit-log.sh" ] || exit 0
 [ -f "$PROGRESS" ] || exit 0
 
 HASH=$(git rev-parse --short=7 HEAD 2>/dev/null) || exit 0
