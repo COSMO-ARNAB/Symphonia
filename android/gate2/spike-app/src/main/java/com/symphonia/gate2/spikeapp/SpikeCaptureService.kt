@@ -45,6 +45,11 @@ class SpikeCaptureService : Service() {
         const val EXTRA_SERVER_URL = "extra_server_url"
         @Volatile var lastLog: String = "idle"
             private set
+        @Volatile var lastRoomId: String? = null
+            private set
+
+        internal fun publishRoomId(id: String) { lastRoomId = id }
+        internal fun clearRoomId() { lastRoomId = null }
     }
 
     private val binder = LocalBinder()
@@ -116,6 +121,7 @@ class SpikeCaptureService : Service() {
         }
         // Room FIRST - the server requires membership before any SFU request.
         val room = signaling!!.request("CREATE_ROOM", JSONObject())
+        publishRoomId(room.getString("roomId"))
         log("room created: ${room.getString("roomId").take(8)}… (full id: ${room.getString("roomId")})")
 
         val rtpCaps = signaling!!.request("GET_ROUTER_RTP_CAPABILITIES", JSONObject())
@@ -173,6 +179,7 @@ class SpikeCaptureService : Service() {
         runCatching { signaling?.close() }
         runCatching { projection?.stop() }
         producer = null; sendTransport = null; signaling = null; projection = null
+        clearRoomId()
         if (Build.VERSION.SDK_INT >= 33) stopForeground(STOP_FOREGROUND_REMOVE) else @Suppress("DEPRECATION") stopForeground(true)
         stopSelf()
     }

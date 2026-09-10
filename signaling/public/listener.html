@@ -21,6 +21,7 @@
 <label for="room">Room ID (from the phone's log line "room created: …")</label>
 <input id="room" placeholder="paste full room id" autocomplete="off" />
 <button id="join">JOIN &amp; LISTEN</button>
+<button id="paste" type="button">PASTE ROOM ID</button>
 <div id="status">idle</div>
 <div id="log"></div>
 
@@ -38,6 +39,17 @@ const { Device } = mediasoupClient;
     setStatus('FAILED: ' + e.message);
     log('ERROR ' + (e && e.stack ? e.stack : e));
   });
+
+  document.getElementById('paste').onclick = async () => {
+    try {
+      const text = (await navigator.clipboard.readText()).trim();
+      if (!text) { log('clipboard is empty'); return; }
+      document.getElementById('room').value = text;
+      log('pasted room id (' + text.slice(0, 8) + '…) from clipboard');
+    } catch (e) {
+      log('clipboard read blocked (' + e.message + ') - paste manually with Ctrl+V');
+    }
+  };
 
   async function main() {
     const room = document.getElementById('room').value.trim();

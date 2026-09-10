@@ -1,6 +1,9 @@
 package com.symphonia.gate2.spikeapp
 
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.media.projection.MediaProjectionManager
 import android.os.Bundle
@@ -26,6 +29,8 @@ import androidx.core.content.ContextCompat
 class SpikeActivity : AppCompatActivity() {
 
     private lateinit var status: TextView
+    private lateinit var roomView: TextView
+    private lateinit var copyButton: Button
     private lateinit var logView: TextView
     private lateinit var urlField: EditText
     private var pendingServerUrl: String? = null
@@ -68,6 +73,25 @@ class SpikeActivity : AppCompatActivity() {
             consentLauncher.launch(pm.createScreenCaptureIntent())
         }
         status = TextView(this).apply { text = "idle"; textSize = 16f }
+        roomView = TextView(this).apply {
+            text = "room: —"
+            textSize = 13f
+            setTextIsSelectable(true)
+        }
+        copyButton = Button(this).apply {
+            text = "COPY ROOM ID"
+            isEnabled = false
+        }
+        copyButton.setOnClickListener {
+            val id = SpikeCaptureService.lastRoomId
+            if (id.isNullOrBlank()) {
+                Toast.makeText(this, "no room yet - start sharing first", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            clipboard.setPrimaryClip(ClipData.newPlainText("symphonia-room", id))
+            Toast.makeText(this, "room id copied", Toast.LENGTH_SHORT).show()
+        }
         logView = TextView(this).apply { text = "log:\n"; setTextIsSelectable(true); textSize = 12f }
         val scroll = ScrollView(this).apply { addView(logView) }
 
@@ -75,6 +99,8 @@ class SpikeActivity : AppCompatActivity() {
         root.addView(urlField)
         root.addView(start)
         root.addView(status)
+        root.addView(roomView)
+        root.addView(copyButton)
         root.addView(scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
         setContentView(root)
 
@@ -83,6 +109,14 @@ class SpikeActivity : AppCompatActivity() {
             override fun run() {
                 status.text = SpikeCaptureService.lastLog
                 postLogOnly(SpikeCaptureService.lastLog)
+                val roomId = SpikeCaptureService.lastRoomId
+                if (roomId.isNullOrBlank()) {
+                    roomView.text = "room: —"
+                    copyButton.isEnabled = false
+                } else {
+                    roomView.text = "room: $roomId"
+                    copyButton.isEnabled = true
+                }
                 Handler(Looper.getMainLooper()).postDelayed(this, 500)
             }
         })
