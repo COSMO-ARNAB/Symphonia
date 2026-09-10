@@ -25,7 +25,9 @@ dependencies {
     // Gate 2 spike: pin the MediaSFU mediasoup client (WebRTC M137) per
     // docs/gate2/client-adapter-decision.md. Fallback A is a one-line swap:
     // io.github.haiyangwu:mediasoup-client:3.4.0
-    implementation("com.mediasfu:mediasoup-client:1.0.8")
+    // api (not implementation): the AAR's org.webrtc + org.mediasoup.droid
+    // classes must propagate to consumers of this module.
+    api("com.mediasfu:mediasoup-client:1.0.8")
 
     // Existing validated PCM pipeline from the repo
     implementation(project(":gate2:contracts"))

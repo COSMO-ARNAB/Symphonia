@@ -1,4 +1,5 @@
 import { createServer, type Server as HttpServer } from "node:http";
+import { readFile } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { WebSocket, WebSocketServer } from "ws";
 import { ZodError } from "zod";
@@ -23,6 +24,24 @@ export class SignalingServer {
     assertSafeHost(options.host, options.unsafeAllowRemote);
     this.http = createServer((request, response) => {
       if (request.url === "/healthz") { response.writeHead(200, { "content-type": "application/json" }); response.end('{"status":"ok"}'); return; }
+      if (request.url === "/" || request.url === "/listener.html" || request.url === "/index.html") {
+        const pagePath = new URL("../public/listener.html", import.meta.url);
+        readFile(pagePath, (error, content) => {
+          if (error) { response.writeHead(404).end(); return; }
+          response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+          response.end(content);
+        });
+        return;
+      }
+      if (request.url === "/mediasoup-client.esm.js") {
+        const jsPath = new URL("../public/mediasoup-client.esm.js", import.meta.url);
+        readFile(jsPath, (error, content) => {
+          if (error) { response.writeHead(404).end(); return; }
+          response.writeHead(200, { "content-type": "text/javascript; charset=utf-8" });
+          response.end(content);
+        });
+        return;
+      }
       response.writeHead(404).end();
     });
     this.wss = new WebSocketServer({ noServer: true, maxPayload: MAX_PAYLOAD_BYTES, perMessageDeflate: false });

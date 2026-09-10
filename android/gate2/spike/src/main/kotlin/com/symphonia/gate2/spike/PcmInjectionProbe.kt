@@ -71,7 +71,7 @@ object PcmInjectionProbe {
 
     /**
      * Core probe. Swap target is found by walking the ADM's private
-     * audioInput (WebRtcAudioRecord) → audioRecord field chain — the state
+     * audioInput (WebRtcAudioRecord) -> audioRecord field chain — the state
      * callback itself carries no back-reference.
      */
     fun run(
@@ -80,34 +80,56 @@ object PcmInjectionProbe {
         onResult: (ProbeResult) -> Unit = {},
     ): ProbeResult {
         var failure: String? = null
-        var swapped = false
-        var captureReady = false
-
-        // 1. Real capture AudioRecord (fail-closed: no mic fallback).
-        val captureRecord = try {
-            val r = buildCaptureAudioRecord(mediaProjection)
-            captureReady = r.state == AudioRecord.STATE_INITIALIZED
-            r
+        val factory = try {
+            buildInjectionFactory(context, mediaProjection) { swapped, reason ->
+                if (!swapped) failure = reason
+            }
         } catch (t: Throwable) {
-            failure = "capture AudioRecord ctor: ${t.message}"; null
-        } ?: return ProbeResult(false, false, false, failure).also(onResult)
+            failure = "injection factory: ${t.message}"; null
+        }
+        return ProbeResult(
+            factoryConstructed = factory != null,
+            recordFieldSwapped = true, // actual swap outcome arrives via callback
+            captureRecordReady = factory != null,
+            failureReason = failure,
+        ).also(onResult)
+    }
 
-        // 2. ADM with the swap wired at the record-start moment.
-        // The callback needs the ADM instance (to walk its audioInput field),
-        // so the builder callback captures a late-bound holder.
+    /**
+     * Builds a PeerConnectionFactory whose recording side swaps the mic
+     * AudioRecord for the app-audio playback-capture AudioRecord at the
+     * onWebRtcAudioRecordStart moment. Returned factory feeds
+     * PeerConnection$Options.setFactory() on the mediasoup Device.
+     *
+     * [onSwapOutcome] reports the live swap result: (true, null) = capture
+     * record active; (false, reason) = mic path is live and MUST be torn
+     * down by the caller (fail-closed — never stream the mic).
+     */
+    fun buildInjectionFactory(
+        context: Context,
+        mediaProjection: MediaProjection,
+        onSwapOutcome: (swapped: Boolean, reason: String?) -> Unit,
+    ): PeerConnectionFactory {
+        val captureRecord = buildCaptureAudioRecord(mediaProjection)
+        check(captureRecord.state == AudioRecord.STATE_INITIALIZED) {
+            "playback-capture AudioRecord not initialized (projection lacks audio?)"
+        }
+
         val admHolder = AtomicReference<JavaAudioDeviceModule?>()
         val adm = JavaAudioDeviceModule.builder(context)
             .setSampleRate(48_000)
             .setUseStereoInput(true)
             .setAudioRecordStateCallback(object : JavaAudioDeviceModule.AudioRecordStateCallback {
                 override fun onWebRtcAudioRecordStart() {
-                    val target = admHolder.get() ?: run {
-                        failure = "swap: ADM not yet constructed"; return
+                    val target = admHolder.get()
+                    if (target == null) {
+                        onSwapOutcome(false, "record start before ADM constructed"); return
                     }
-                    swapped = try {
-                        swapRecordField(target, captureRecord)
+                    try {
+                        val swapped = swapRecordField(target, captureRecord)
+                        onSwapOutcome(swapped, if (swapped) null else "swap returned false")
                     } catch (t: Throwable) {
-                        failure = "swap: ${t.message}"; false
+                        onSwapOutcome(false, "swap: ${t.message}")
                     }
                 }
                 override fun onWebRtcAudioRecordStop() {}
@@ -115,22 +137,9 @@ object PcmInjectionProbe {
             .createAudioDeviceModule()
         admHolder.set(adm)
 
-        // 3. Factory with our ADM — the thing mediasoup's
-        //    PeerConnection$Options.setFactory() accepts.
-        val factory = try {
-            PeerConnectionFactory.builder()
-                .setAudioDeviceModule(adm)
-                .createPeerConnectionFactory()
-        } catch (t: Throwable) {
-            failure = (failure?.plus(" | ") ?: "") + "factory: ${t.message}"; null
-        }
-
-        return ProbeResult(
-            factoryConstructed = factory != null,
-            recordFieldSwapped = swapped,
-            captureRecordReady = captureReady,
-            failureReason = failure,
-        ).also(onResult)
+        return PeerConnectionFactory.builder()
+            .setAudioDeviceModule(adm)
+            .createPeerConnectionFactory()
     }
 
     /**
