@@ -1,0 +1,101 @@
+# Documentation & local notes (keep private/internal)
+*.md
+!README.md
+!**/README.md
+docs/
+progress.md
+
+# Local editor & developer tooling
+AGENTS.md
+CLAUDE.md
+COPILOT.md
+copilot-instructions.md
+.agents/
+.codex/
+.claude/
+.cursor/
+.cursorrules
+.cursorignore
+.cursorindexingignore
+.windsurf/
+.windsurfrules
+.continue/
+.devin/
+devin.json
+.v0/
+.aider*
+.gemini/
+.antigravity/
+.opencode/
+.workbuddy-ai/
+opencode.jsonc
+.hermes/
+graphify-out/
+.graphify*
+*.graphify*
+
+# Build outputs & IDE files
+.gradle/
+**/build/
+local.properties
+**/bin/
+**/.idea/
+**/.vscode/
+*.iml
+
+# Node / JS dependencies and build artifacts
+node_modules/
+dist/
+coverage/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# Local test & scratch scripts
+scratch/
+prompts/
+prompt/
+*.prompt
+hermes-verify-*.py
+verify-*.py
+ztest*
+bisect-*
+*-scratch.*
+scripts/*progress*
+scripts/install-progress-hook.sh
+
+# Device UI dumps & screenshots
+ui_*.xml
+spike_*.png
+screen*.png
+screencap*.png
+
+# Python bytecode & virtualenvs
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# TypeScript incremental build info
+*.tsbuildinfo
+
+# Editor / merge droppings
+*~
+*.orig
+*.rej
+*.bak
+
+# OS junk
+Thumbs.db
+Desktop.ini
+.DS_Store

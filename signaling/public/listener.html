@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Symphonia Gate2 Spike — Listener</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+  #status { font-weight: bold; margin: 1rem 0; }
+  input { width: 100%; box-sizing: border-box; padding: 0.5rem; font: inherit; margin: 0.25rem 0 1rem; }
+  button { padding: 0.5rem 1.5rem; font: inherit; cursor: pointer; }
+  #log { white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 12px;
+         background: #f3f3f3; padding: 1rem; margin-top: 1.5rem; border-radius: 6px; }
+  .hint { color: #555; font-size: 14px; }
+</style>
+</head>
+<body>
+<h2>Symphonia Gate2 Spike — Listener (throwaway)</h2>
+<p class="hint">Chrome on the laptop. Join the room created by the phone (Speaker) and listen.</p>
+
+<label for="room">Room ID (from the phone's log line "room created: …")</label>
+<input id="room" placeholder="paste full room id" autocomplete="off" />
+<button id="join">JOIN &amp; LISTEN</button>
+<button id="paste" type="button">PASTE ROOM ID</button>
+<div id="status">idle</div>
+<div id="log"></div>
+
+<script type="module">
+import mediasoupClient from '/mediasoup-client.esm.js';
+const { Device } = mediasoupClient;
+
+(async () => {
+  const logEl = document.getElementById('log');
+  const statusEl = document.getElementById('status');
+  const log = (m) => { logEl.textContent += m + '\n'; };
+  const setStatus = (s) => { statusEl.textContent = s; };
+
+  document.getElementById('join').onclick = () => main().catch((e) => {
+    setStatus('FAILED: ' + e.message);
+    log('ERROR ' + (e && e.stack ? e.stack : e));
+  });
+
+  document.getElementById('paste').onclick = async () => {
+    try {
+      const text = (await navigator.clipboard.readText()).trim();
+      if (!text) { log('clipboard is empty'); return; }
+      document.getElementById('room').value = text;
+      log('pasted room id (' + text.slice(0, 8) + '…) from clipboard');
+    } catch (e) {
+      log('clipboard read blocked (' + e.message + ') - paste manually with Ctrl+V');
+    }
+  };
+
+  async function main() {
+    const room = document.getElementById('room').value.trim();
+    if (!room) throw new Error('paste the room id from the phone first');
+    setStatus('connecting…');
+    log('join room ' + room.slice(0, 8) + '…');
+
+    const device = new Device();
+
+    // --- signaling over the same origin as this page ---
+    const ws = new WebSocket(`ws://${location.host}/gate2`);
+    const pending = new Map();
+    let nextId = 0;
+    ws.onmessage = (ev) => {
+      const msg = JSON.parse(ev.data);
+      if (msg.id && pending.has(msg.id)) { pending.get(msg.id)(msg); pending.delete(msg.id); }
+      else log('server: ' + msg.type);
+    };
+    const opened = new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
+    await opened;
+
+    const request = (type, data) => new Promise((resolve, reject) => {
+      const id = 'web-' + (nextId++);
+      pending.set(id, (msg) => {
+        if (msg.ok) resolve(msg.data);
+        else reject(new Error(type + ': ' + (msg.error ? msg.error.code + ' ' + msg.error.message : 'no error body')));
+      });
+      ws.send(JSON.stringify({ id, type, data }));
+    });
+
+    const joined = await request('JOIN_ROOM', { roomId: room });
+    log('joined room');
+    setStatus('joined - loading device…');
+
+    const { rtpCapabilities } = await request('GET_ROUTER_RTP_CAPABILITIES');
+    await device.load({ routerRtpCapabilities: rtpCapabilities });
+    log('device loaded, canProduceAudio=' + device.canProduce('audio'));
+
+    const t = await request('CREATE_WEBRTC_TRANSPORT', { direction: 'recv' });
+    const recv = device.createRecvTransport({
+      id: t.id, iceParameters: t.iceParameters, iceCandidates: t.iceCandidates, dtlsParameters: t.dtlsParameters,
+    });
+    recv.on('connect', ({ dtlsParameters }, cb, errback) =>
+      request('CONNECT_WEBRTC_TRANSPORT', { transportId: t.id, dtlsParameters })
+        .then(() => cb()).catch(errback));
+    log('recv transport created - waiting for producer…');
+
+    // If the producer is already live, the join response carried its id;
+    // otherwise wait for the PRODUCER_AVAILABLE notification.
+    const producerAvailable = new Promise((resolve) => {
+      if (joined.producerId) resolve(joined.producerId);
+      const handler = (ev) => {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === 'PRODUCER_AVAILABLE') { ws.removeEventListener('message', handler); resolve(msg.data.producerId); }
+      };
+      ws.addEventListener('message', handler);
+    });
+    const producerId = await producerAvailable;
+    log('producer available: ' + String(producerId).slice(0, 8) + '…');
+    setStatus('producer found - consuming…');
+
+    // The app zod schema allows codec/ext kind fields, and mediasoup REQUIRES ext.kind
+    // ('audio'/'video') in validateAndNormalizeRtpHeaderExtension - stripping it made
+    // canConsume throw 'invalid ext.kind' (surfacing as N-CANNOT_CONSUME). Keep audio
+    // kinds explicit; drop video entries entirely.
+    const caps = JSON.parse(JSON.stringify(device.rtpCapabilities));
+    caps.codecs = caps.codecs.map(({ kind, ...c }) => c);
+    caps.headerExtensions = (caps.headerExtensions || [])
+      .filter((e) => !e.kind || e.kind === 'audio')
+      .map((e) => ({ kind: 'audio', ...e }));
+    // mediasoup matches audio codecs on channels EXACTLY; if the producer is mono (native
+    // libwebrtc wrappers often omit channels -> defaults to 1), stereo caps cannot consume it.
+    let info;
+    try {
+      info = await request('CONSUME', { transportId: t.id, producerId, rtpCapabilities: caps });
+    } catch (e) {
+      if (!/N-CANNOT_CONSUME/.test(String(e.message))) throw e;
+      const monoCaps = JSON.parse(JSON.stringify(caps));
+      monoCaps.codecs = monoCaps.codecs.map((c) => ({ ...c, channels: 1 }));
+      log('stereo caps rejected - retrying with mono channels:1');
+      info = await request('CONSUME', { transportId: t.id, producerId, rtpCapabilities: monoCaps });
+    }
+    const consumer = await recv.consume({
+      id: info.id, producerId: info.producerId, kind: info.kind,
+      rtpParameters: info.rtpParameters,
+    });
+    await request('RESUME_CONSUMER', { consumerId: consumer.id });
+    log('consumer resumed - attaching track…');
+
+    // THROWAWAY spike diagnostics: expose transport/consumer + poll RTP stats
+    window.__spike = { recv, consumer, device };
+    const statTimer = setInterval(async () => {
+      try {
+        const stats = await recv.getStats();
+        let bytes = -1, state = recv.connectionState, ice = null;
+        stats.forEach((r) => {
+          if (r.type === 'inbound-rtp' && (r.kind === 'audio' || r.mediaType === 'audio')) bytes = r.bytesReceived;
+          if (r.type === 'transport') ice = r.dtlsState + '/' + r.iceRole;
+        });
+        log(`stats: conn=${state} ice=${ice} bytesReceived=${bytes} paused=${consumer.paused} prodPaused=${consumer.producerPaused} muted=${consumer.track.muted}`);
+      } catch (e) { log('stats err: ' + e.message); }
+    }, 3000);
+
+    const track = consumer.track;
+    const stream = new MediaStream([track]);
+    const audio = document.createElement('audio');
+    audio.srcObject = stream;
+    audio.autoplay = true;
+    document.body.appendChild(audio);
+    // Chrome autoplay policy: the JOIN click is the user gesture, so play() resolves.
+    try { await audio.play(); } catch (e) { log('autoplay blocked (' + e.message + ') - click the page once'); }
+    consumer.on('transportclose', () => setStatus('transport closed'));
+
+    setStatus('LISTENING - audio should be playing from laptop speakers');
+    log('LISTENING - if you hear the phone music, the spike PASSED');
+  }
+})();
+</script>
+</body>
+</html>
