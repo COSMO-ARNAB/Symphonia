@@ -61,6 +61,16 @@ export class SignalingService {
     await this.sfuFactory.close();
   }
 
+  /** THROWAWAY spike diagnostic: list rooms (ids + producer presence only, local-only). */
+  debugRoomList(): Array<{ roomId: string; participants: number; hasProducer: boolean; state: string }> {
+    return [...this.rooms.values()].map((room) => ({
+      roomId: room.id,
+      participants: room.participants.size,
+      hasProducer: !!room.producer,
+      state: room.state.state,
+    }));
+  }
+
   private async createRoom(peer: ClientPeer, displayName?: string) {
     this.ensureNotJoined(peer);
     this.ensureConnected(peer);

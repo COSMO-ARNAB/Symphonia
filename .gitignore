@@ -1,20 +1,38 @@
-# Ignore all markdown files (keep locally, do not commit)
+# Documentation & local notes (keep private/internal)
 *.md
-**/*.md
-
-# Documentation (private/internal)
+!README.md
+!**/README.md
 docs/
+progress.md
 
-# AI Assistant & Tool Configuration (Local only, do not push)
+# Local editor & developer tooling
 AGENTS.md
+CLAUDE.md
+COPILOT.md
+copilot-instructions.md
 .agents/
-graphify-out/
 .codex/
 .claude/
-.graphifyignore
+.cursor/
+.cursorrules
+.cursorignore
+.cursorindexingignore
+.windsurf/
+.windsurfrules
+.continue/
+.devin/
+devin.json
+.v0/
+.aider*
+.gemini/
+.antigravity/
 .opencode/
 .workbuddy-ai/
 opencode.jsonc
+.hermes/
+graphify-out/
+.graphify*
+*.graphify*
 
 # Build outputs & IDE files
 .gradle/
@@ -39,3 +57,45 @@ yarn-error.log*
 .env.local
 .env.*.local
 
+# Logs
+*.log
+logs/
+
+# Local test & scratch scripts
+scratch/
+prompts/
+prompt/
+*.prompt
+hermes-verify-*.py
+verify-*.py
+ztest*
+bisect-*
+*-scratch.*
+scripts/*progress*
+scripts/install-progress-hook.sh
+
+# Device UI dumps & screenshots
+ui_*.xml
+spike_*.png
+screen*.png
+screencap*.png
+
+# Python bytecode & virtualenvs
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# TypeScript incremental build info
+*.tsbuildinfo
+
+# Editor / merge droppings
+*~
+*.orig
+*.rej
+*.bak
+
+# OS junk
+Thumbs.db
+Desktop.ini
+.DS_Store

@@ -1,4 +1,5 @@
 import * as mediasoup from "mediasoup";
+import { appendFileSync } from "node:fs";
 import type { Consumer, DtlsParameters, MediaKind, Producer, Router, RtpCapabilities, RtpParameters, WebRtcServer, WebRtcTransport, Worker } from "mediasoup/types";
 import type { ConsumerInfo, JsonObject, ProducerInfo, RoomSfu, SfuFactory, TransportInfo } from "./sfu.js";
 
@@ -100,7 +101,17 @@ class MediasoupRoomSfu implements RoomSfu {
   }
 
   canConsume(producerId: string, rtpCapabilities: JsonObject): boolean {
-    return this.router.canConsume({ producerId, rtpCapabilities: rtpCapabilities as unknown as RtpCapabilities });
+    const ok = this.router.canConsume({ producerId, rtpCapabilities: rtpCapabilities as unknown as RtpCapabilities });
+    if (!ok) {
+      // THROWAWAY spike diagnostic: dump producer codecs vs consumer caps to a file
+      // (stdout of this daemon is unreliable on this Windows box - orphaned wrappers)
+      const producer = this.producers.get(producerId)?.value;
+      const producerCodecs = producer ? JSON.stringify((producer as unknown as { rtpParameters: { codecs?: unknown[] } }).rtpParameters.codecs) : "producer not found";
+      const line = JSON.stringify({ level: "warn", event: "canConsume_mismatch", producerId, producerCodecs, consumerCaps: JSON.stringify(rtpCapabilities).slice(0, 800) });
+      try { appendFileSync("C:/Users/arnab/AppData/Local/Temp/spike-canconsume-diag.log", line + "\n"); } catch { /* best effort */ }
+      console.warn(line);
+    }
+    return ok;
   }
 
   async consume(participantId: string, transportId: string, producerId: string, rtpCapabilities: JsonObject, signal?: AbortSignal): Promise<ConsumerInfo> {

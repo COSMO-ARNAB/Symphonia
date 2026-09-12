@@ -111,12 +111,47 @@ const { Device } = mediasoupClient;
     log('producer available: ' + String(producerId).slice(0, 8) + '…');
     setStatus('producer found - consuming…');
 
+    // The app zod schema allows codec/ext kind fields, and mediasoup REQUIRES ext.kind
+    // ('audio'/'video') in validateAndNormalizeRtpHeaderExtension - stripping it made
+    // canConsume throw 'invalid ext.kind' (surfacing as N-CANNOT_CONSUME). Keep audio
+    // kinds explicit; drop video entries entirely.
+    const caps = JSON.parse(JSON.stringify(device.rtpCapabilities));
+    caps.codecs = caps.codecs.map(({ kind, ...c }) => c);
+    caps.headerExtensions = (caps.headerExtensions || [])
+      .filter((e) => !e.kind || e.kind === 'audio')
+      .map((e) => ({ kind: 'audio', ...e }));
+    // mediasoup matches audio codecs on channels EXACTLY; if the producer is mono (native
+    // libwebrtc wrappers often omit channels -> defaults to 1), stereo caps cannot consume it.
+    let info;
+    try {
+      info = await request('CONSUME', { transportId: t.id, producerId, rtpCapabilities: caps });
+    } catch (e) {
+      if (!/N-CANNOT_CONSUME/.test(String(e.message))) throw e;
+      const monoCaps = JSON.parse(JSON.stringify(caps));
+      monoCaps.codecs = monoCaps.codecs.map((c) => ({ ...c, channels: 1 }));
+      log('stereo caps rejected - retrying with mono channels:1');
+      info = await request('CONSUME', { transportId: t.id, producerId, rtpCapabilities: monoCaps });
+    }
     const consumer = await recv.consume({
-      producerId, rtpCapabilities: device.rtpCapabilities, paused: true,
+      id: info.id, producerId: info.producerId, kind: info.kind,
+      rtpParameters: info.rtpParameters,
     });
-    await request('CONSUME', { transportId: t.id, producerId, rtpCapabilities: device.rtpCapabilities });
     await request('RESUME_CONSUMER', { consumerId: consumer.id });
     log('consumer resumed - attaching track…');
+
+    // THROWAWAY spike diagnostics: expose transport/consumer + poll RTP stats
+    window.__spike = { recv, consumer, device };
+    const statTimer = setInterval(async () => {
+      try {
+        const stats = await recv.getStats();
+        let bytes = -1, state = recv.connectionState, ice = null;
+        stats.forEach((r) => {
+          if (r.type === 'inbound-rtp' && (r.kind === 'audio' || r.mediaType === 'audio')) bytes = r.bytesReceived;
+          if (r.type === 'transport') ice = r.dtlsState + '/' + r.iceRole;
+        });
+        log(`stats: conn=${state} ice=${ice} bytesReceived=${bytes} paused=${consumer.paused} prodPaused=${consumer.producerPaused} muted=${consumer.track.muted}`);
+      } catch (e) { log('stats err: ' + e.message); }
+    }, 3000);
 
     const track = consumer.track;
     const stream = new MediaStream([track]);

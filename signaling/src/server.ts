@@ -24,6 +24,12 @@ export class SignalingServer {
     assertSafeHost(options.host, options.unsafeAllowRemote);
     this.http = createServer((request, response) => {
       if (request.url === "/healthz") { response.writeHead(200, { "content-type": "application/json" }); response.end('{"status":"ok"}'); return; }
+      // THROWAWAY spike diagnostic (local-only rig, never expose): list live rooms.
+      if (request.url === "/debug/rooms") {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ rooms: this.service.debugRoomList() }));
+        return;
+      }
       if (request.url === "/" || request.url === "/listener.html" || request.url === "/index.html") {
         const pagePath = new URL("../public/listener.html", import.meta.url);
         readFile(pagePath, (error, content) => {
