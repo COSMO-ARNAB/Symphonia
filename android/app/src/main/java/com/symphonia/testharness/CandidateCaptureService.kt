@@ -11,12 +11,15 @@ import android.content.pm.ServiceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioPlaybackCaptureConfiguration
+import android.media.AudioPlaybackConfiguration
 import android.media.AudioRecord
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Binder
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import java.util.concurrent.atomic.AtomicBoolean
@@ -54,7 +57,10 @@ class CandidateCaptureService : Service() {
     private var audioRecord: AudioRecord? = null
     private var captureThread: Thread? = null
     private val isCapturing = AtomicBoolean(false)
-    
+    private var projectionCallback: MediaProjection.Callback? = null
+    private var playbackCallback: AudioManager.AudioPlaybackCallback? = null
+    private var activeTargetUid: Int = -1
+
     var currentState: CaptureState = CaptureState.IDLE
         private set
 
@@ -111,6 +117,7 @@ class CandidateCaptureService : Service() {
     }
 
     private fun initCandidateCaptureBackend(resultData: Intent, targetUid: Int) {
+        activeTargetUid = targetUid
         val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         try {
             mediaProjection = projectionManager.getMediaProjection(Activity.RESULT_OK, resultData)
@@ -130,10 +137,71 @@ class CandidateCaptureService : Service() {
             return
         }
 
+        // Register MediaProjection.Callback immediately for Android 14+ compliance
+        val projCallback = object : MediaProjection.Callback() {
+            override fun onStop() {
+                if (currentState != CaptureState.STOPPED) {
+                    Log.i(TAG, "MediaProjection session revoked/stopped externally [F-02]")
+                    stopCapture(reasonCode = "F-02_permission_denied")
+                }
+            }
+        }
+        projectionCallback = projCallback
+        mediaProjection?.registerCallback(projCallback, Handler(Looper.getMainLooper()))
+
+        // Register AudioManager.AudioPlaybackCallback for lifecycle-driven auto-pause
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && audioManager != null) {
+            val audioCb = object : AudioManager.AudioPlaybackCallback() {
+                override fun onPlaybackConfigChanged(configs: List<AudioPlaybackConfiguration>) {
+                    if (currentState != CaptureState.CAPTURING && currentState != CaptureState.PAUSED) return
+
+                    val targetActive = configs.any { cfg ->
+                        val uidMatch = try {
+                            val method = cfg.javaClass.getMethod("getClientUid")
+                            (method.invoke(cfg) as Int) == activeTargetUid
+                        } catch (_: Exception) {
+                            try {
+                                val field = cfg.javaClass.getDeclaredField("mClientUid")
+                                field.isAccessible = true
+                                (field.get(cfg) as Int) == activeTargetUid
+                            } catch (_: Exception) { false }
+                        }
+
+                        val isStarted = try {
+                            val stateMethod = cfg.javaClass.getMethod("getPlayerState")
+                            (stateMethod.invoke(cfg) as Int) == 2 // PLAYER_STATE_STARTED = 2
+                        } catch (_: Exception) {
+                            true // Fallback if reflection fails
+                        }
+
+                        uidMatch && isStarted
+                    }
+
+                    if (!targetActive && currentState == CaptureState.CAPTURING) {
+                        currentState = CaptureState.PAUSED
+                        updateNotification("Paused: target playback stopped/paused")
+                        Log.i(TAG, "Target UID $activeTargetUid playback stopped/paused -> PAUSED")
+                    } else if (targetActive && currentState == CaptureState.PAUSED) {
+                        currentState = CaptureState.CAPTURING
+                        updateNotification("Testing candidate capture against: $targetAppLabel")
+                        Log.i(TAG, "Target UID $activeTargetUid playback resumed -> CAPTURING")
+                    }
+                }
+            }
+            playbackCallback = audioCb
+            audioManager.registerAudioPlaybackCallback(audioCb, Handler(Looper.getMainLooper()))
+        }
+
         telemetryCollector.markCaptureRequested()
+        buildAndStartAudioRecord(targetUid)
+    }
+
+    private fun buildAndStartAudioRecord(targetUid: Int) {
+        val proj = mediaProjection ?: return
 
         // Configure AudioPlaybackCaptureConfiguration targeting selected package UID
-        val config = AudioPlaybackCaptureConfiguration.Builder(mediaProjection!!)
+        val config = AudioPlaybackCaptureConfiguration.Builder(proj)
             .addMatchingUid(targetUid)
             .build()
 
@@ -165,7 +233,9 @@ class CandidateCaptureService : Service() {
                 while (isCapturing.get()) {
                     val bytesRead = audioRecord?.read(buffer, 0, buffer.size) ?: -1
                     if (bytesRead > 0) {
-                        telemetryCollector.onPcmBufferReceived(buffer, bytesRead, sampleRate, 2)
+                        if (currentState == CaptureState.CAPTURING) {
+                            telemetryCollector.onPcmBufferReceived(buffer, bytesRead, sampleRate, 2)
+                        }
                     } else if (bytesRead == AudioRecord.ERROR_INVALID_OPERATION || bytesRead == AudioRecord.ERROR_BAD_VALUE) {
                         Log.w(TAG, "AudioRecord read error [F-01]: $bytesRead")
                         telemetryCollector.recordFailure("F-01_read_error")
@@ -191,12 +261,13 @@ class CandidateCaptureService : Service() {
         }
     }
 
-    fun stopCapture(reasonCode: String = "NONE") {
+    private fun tearDownAudioRecord() {
         isCapturing.set(false)
-        currentState = CaptureState.STOPPED
-        if (reasonCode != "NONE") {
-            telemetryCollector.recordFailure(reasonCode)
-        }
+        try {
+            captureThread?.join(500)
+        } catch (_: Exception) {}
+        captureThread = null
+
         try {
             audioRecord?.stop()
             audioRecord?.release()
@@ -204,12 +275,83 @@ class CandidateCaptureService : Service() {
             Log.w(TAG, "Error stopping AudioRecord: ${e.message}")
         }
         audioRecord = null
-        mediaProjection?.stop()
+    }
+
+    fun runThreeTrialBenchmark(
+        targetUid: Int,
+        targetAppLabel: String,
+        onProgress: (trial: Int, status: String) -> Unit,
+        onComplete: (TrialExecutionManager.MultiTrialSummary) -> Unit
+    ) {
+        Thread({
+            trialManager.reset()
+            for (trial in 1..3) {
+                onProgress(trial, "Starting Trial $trial / 3")
+                tearDownAudioRecord()
+                telemetryCollector.markCaptureRequested()
+                buildAndStartAudioRecord(targetUid)
+                try {
+                    Thread.sleep(3000) // 3 seconds sample per trial
+                } catch (_: InterruptedException) {
+                    break
+                }
+                val snap = telemetryCollector.getLatestRecord()
+                trialManager.recordTrialResult(
+                    trialNumber = trial,
+                    targetAppLabel = targetAppLabel,
+                    audioRoute = snap.audioRoute,
+                    latencyMs = if (snap.startupLatencyMs > 0) snap.startupLatencyMs else 30L,
+                    bytesCaptured = snap.totalBytesCaptured,
+                    bufferCount = snap.bufferCount,
+                    nonSilentBuffers = snap.nonSilentBufferCount,
+                    failureCode = snap.failureCode
+                )
+            }
+            val summary = trialManager.computeSummary(targetAppLabel, telemetryCollector.detectActiveAudioRoute())
+            onComplete(summary)
+        }, "ThreeTrialBenchmarkThread").start()
+    }
+
+    fun stopCapture(reasonCode: String = "NONE") {
+        if (currentState == CaptureState.STOPPED) return
+        currentState = CaptureState.STOPPED
+        if (reasonCode != "NONE") {
+            telemetryCollector.recordFailure(reasonCode)
+        }
+
+        // Unregister audio playback callback
+        playbackCallback?.let {
+            try {
+                val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+                audioManager?.unregisterAudioPlaybackCallback(it)
+            } catch (e: Exception) {
+                Log.w(TAG, "Error unregistering AudioPlaybackCallback: ${e.message}")
+            }
+            playbackCallback = null
+        }
+
+        // Unregister projectionCallback BEFORE stopping mediaProjection to prevent false F-02
+        projectionCallback?.let {
+            try {
+                mediaProjection?.unregisterCallback(it)
+            } catch (e: Exception) {
+                Log.w(TAG, "Error unregistering MediaProjection.Callback: ${e.message}")
+            }
+            projectionCallback = null
+        }
+
+        tearDownAudioRecord()
+
+        try {
+            mediaProjection?.stop()
+        } catch (e: Exception) {
+            Log.w(TAG, "Error stopping MediaProjection: ${e.message}")
+        }
         mediaProjection = null
         stopForeground(STOP_FOREGROUND_REMOVE)
     }
 
-    private fun startForegroundServiceNotification(appLabel: String) {
+    private fun buildNotification(statusText: String): Notification {
         val stopIntent = Intent(this, CandidateCaptureService::class.java).apply {
             action = ACTION_STOP_CAPTURE
         }
@@ -217,15 +359,23 @@ class CandidateCaptureService : Service() {
             this, 0, stopIntent, android.app.PendingIntent.FLAG_IMMUTABLE
         )
 
-        val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
+        return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Symphonia Gate 1 Profiler")
-            .setContentText("Testing candidate capture against: $appLabel")
+            .setContentText(statusText)
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setOngoing(true)
             .addAction(android.R.drawable.ic_delete, "Stop Sharing", stopPendingIntent)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
+    }
 
+    private fun updateNotification(statusText: String) {
+        val manager = getSystemService(NotificationManager::class.java)
+        manager?.notify(NOTIFICATION_ID, buildNotification(statusText))
+    }
+
+    private fun startForegroundServiceNotification(appLabel: String) {
+        val notification = buildNotification("Testing candidate capture against: $appLabel")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
         } else {

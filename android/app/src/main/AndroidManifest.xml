@@ -54,6 +54,17 @@
             android:exported="false"
             android:foregroundServiceType="mediaProjection" />
 
+        <!-- Notification Listener Service providing ComponentName for MediaSessionManager discovery -->
+        <service
+            android:name=".MediaNotificationListenerService"
+            android:label="Symphonia Media Session Helper"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
     </application>
 
 </manifest>

@@ -9,7 +9,7 @@ import kotlin.math.sqrt
  * Computes mean latency, standard deviation, buffer throughput, and exports structured results
  * for versioned run archives under docs/gate1/runs/run-XXX/.
  */
-class TrialExecutionManager(private val telemetryCollector: Gate1TelemetryCollector) {
+class TrialExecutionManager(private val telemetryCollector: Gate1TelemetryCollector? = null) {
 
     companion object {
         private const val TAG = "TrialExecutionManager"

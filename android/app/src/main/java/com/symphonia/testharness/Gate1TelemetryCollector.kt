@@ -215,9 +215,25 @@ class Gate1TelemetryCollector(private val context: Context) {
         return if (level >= 0 && scale > 0) ((level.toFloat() / scale.toFloat()) * 100).toInt() else 100
     }
 
+    private var lastCpuTimeMs: Long = 0L
+    private var lastSampleTimeMs: Long = 0L
+
     private fun estimateCpuUsagePct(): Float {
-        // Lightweight heuristic CPU usage percentage for prototype telemetry
-        return (8.5f + (Math.random() * 4.0)).toFloat()
+        val now = android.os.SystemClock.elapsedRealtime()
+        val cpuTime = android.os.Process.getElapsedCpuTime()
+        if (lastSampleTimeMs == 0L) {
+            lastSampleTimeMs = now
+            lastCpuTimeMs = cpuTime
+            return 0.0f
+        }
+        val timeDiff = now - lastSampleTimeMs
+        val cpuDiff = cpuTime - lastCpuTimeMs
+        lastSampleTimeMs = now
+        lastCpuTimeMs = cpuTime
+        if (timeDiff <= 0L) return 0.0f
+        val cores = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
+        val pct = (cpuDiff.toFloat() / (timeDiff * cores).toFloat()) * 100.0f
+        return pct.coerceIn(0.0f, 100.0f)
     }
 
     fun getLatestRecord(): TelemetryRecord {
@@ -296,5 +312,17 @@ class Gate1TelemetryCollector(private val context: Context) {
             sb.append("${r.timestampMs},\"${r.audioRoute}\",${r.sampleRateHz},${r.channelCount},${r.totalBytesCaptured}\n")
         }
         return sb.toString()
+    }
+
+    fun exportAllToDirectory(targetDir: java.io.File): List<java.io.File> {
+        if (!targetDir.exists()) targetDir.mkdirs()
+        val files = mutableListOf<java.io.File>()
+        val envFile = java.io.File(targetDir, "environment.json").apply { writeText(exportEnvironmentJson()) }
+        val latFile = java.io.File(targetDir, "latency.csv").apply { writeText(exportLatencyCsv()) }
+        val batFile = java.io.File(targetDir, "battery.csv").apply { writeText(exportBatteryCsv()) }
+        val thmFile = java.io.File(targetDir, "thermal.csv").apply { writeText(exportThermalCsv()) }
+        val artFile = java.io.File(targetDir, "audio_route.csv").apply { writeText(exportAudioRouteCsv()) }
+        files.addAll(listOf(envFile, latFile, batFile, thmFile, artFile))
+        return files
     }
 }

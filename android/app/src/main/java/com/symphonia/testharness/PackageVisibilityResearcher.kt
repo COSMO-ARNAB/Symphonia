@@ -24,6 +24,14 @@ class PackageVisibilityResearcher(private val context: Context) {
         val discoveryMethod: String
     )
 
+    fun isNotificationListenerEnabled(): Boolean {
+        val flat = android.provider.Settings.Secure.getString(
+            context.contentResolver, "enabled_notification_listeners"
+        ) ?: return false
+        val cn = android.content.ComponentName(context, MediaNotificationListenerService::class.java).flattenToString()
+        return flat.contains(cn)
+    }
+
     fun evaluateMediaSourceDiscovery(): List<DiscoveredMediaSource> {
         val discoveredSources = mutableListOf<DiscoveredMediaSource>()
         val pm = context.packageManager
@@ -31,7 +39,13 @@ class PackageVisibilityResearcher(private val context: Context) {
         // 1. Method A: Active Media Sessions (MediaSessionManager)
         try {
             val mediaSessionManager = context.getSystemService(Context.MEDIA_SESSION_SERVICE) as? MediaSessionManager
-            val activeSessions = mediaSessionManager?.getActiveSessions(null)
+            val componentName = android.content.ComponentName(context, MediaNotificationListenerService::class.java)
+            val activeSessions = if (isNotificationListenerEnabled()) {
+                mediaSessionManager?.getActiveSessions(componentName)
+            } else {
+                Log.w(TAG, "NotificationListenerService not enabled in Settings; skipping getActiveSessions")
+                null
+            }
             activeSessions?.forEach { controller ->
                 val pkg = controller.packageName
                 try {
