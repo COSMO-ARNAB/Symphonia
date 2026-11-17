@@ -5,16 +5,18 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.media.AudioFormat
-import android.media.AudioManager
 import android.media.AudioPlaybackCaptureConfiguration
-import android.media.AudioPlaybackConfiguration
 import android.media.AudioRecord
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.media.session.MediaController
+import android.media.session.MediaSessionManager
+import android.media.session.PlaybackState
 import android.os.Binder
 import android.os.Build
 import android.os.Handler
@@ -28,7 +30,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Candidate Capture Backend Foreground Service.
  * Evaluates AudioPlaybackCaptureConfiguration (API 29+) scoped by target package UID.
  * Manages the capture state machine: IDLE -> REQUESTING_CAPTURE -> CAPTURING -> PAUSED -> STOPPED.
- * Integrates AudioManager playback callbacks for OS lifecycle-driven pause/resume (zero silence detection hacks).
+ * Integrates MediaSessionManager playback-session callbacks for OS lifecycle-driven pause/resume (zero silence detection hacks).
  * Tracks Failure Taxonomy codes (F-01 through F-99) per PRD §7.7.
  */
 class CandidateCaptureService : Service() {
@@ -58,7 +60,10 @@ class CandidateCaptureService : Service() {
     private var captureThread: Thread? = null
     private val isCapturing = AtomicBoolean(false)
     private var projectionCallback: MediaProjection.Callback? = null
-    private var playbackCallback: AudioManager.AudioPlaybackCallback? = null
+    private var activeSessionsListener: MediaSessionManager.OnActiveSessionsChangedListener? = null
+    private var sessionCallback: MediaController.Callback? = null
+    private var attachedController: MediaController? = null
+    private var attachedSessionPackage: String? = null
     private var activeTargetUid: Int = -1
 
     var currentState: CaptureState = CaptureState.IDLE
@@ -149,52 +154,84 @@ class CandidateCaptureService : Service() {
         projectionCallback = projCallback
         mediaProjection?.registerCallback(projCallback, Handler(Looper.getMainLooper()))
 
-        // Register AudioManager.AudioPlaybackCallback for lifecycle-driven auto-pause
-        val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && audioManager != null) {
-            val audioCb = object : AudioManager.AudioPlaybackCallback() {
-                override fun onPlaybackConfigChanged(configs: List<AudioPlaybackConfiguration>) {
-                    if (currentState != CaptureState.CAPTURING && currentState != CaptureState.PAUSED) return
-
-                    val targetActive = configs.any { cfg ->
-                        val uidMatch = try {
-                            val method = cfg.javaClass.getMethod("getClientUid")
-                            (method.invoke(cfg) as Int) == activeTargetUid
-                        } catch (_: Exception) {
-                            try {
-                                val field = cfg.javaClass.getDeclaredField("mClientUid")
-                                field.isAccessible = true
-                                (field.get(cfg) as Int) == activeTargetUid
-                            } catch (_: Exception) { false }
-                        }
-
-                        val isStarted = try {
-                            val stateMethod = cfg.javaClass.getMethod("getPlayerState")
-                            (stateMethod.invoke(cfg) as Int) == 2 // PLAYER_STATE_STARTED = 2
-                        } catch (_: Exception) {
-                            true // Fallback if reflection fails
-                        }
-
-                        uidMatch && isStarted
-                    }
-
-                    if (!targetActive && currentState == CaptureState.CAPTURING) {
-                        currentState = CaptureState.PAUSED
-                        updateNotification("Paused: target playback stopped/paused")
-                        Log.i(TAG, "Target UID $activeTargetUid playback stopped/paused -> PAUSED")
-                    } else if (targetActive && currentState == CaptureState.PAUSED) {
-                        currentState = CaptureState.CAPTURING
-                        updateNotification("Testing candidate capture against: $targetAppLabel")
-                        Log.i(TAG, "Target UID $activeTargetUid playback resumed -> CAPTURING")
-                    }
-                }
-            }
-            playbackCallback = audioCb
-            audioManager.registerAudioPlaybackCallback(audioCb, Handler(Looper.getMainLooper()))
-        }
+        // Register OS playback-session lifecycle callbacks for auto-pause/resume.
+        // Per Technical Architecture: pause/resume is driven by OS playback-session
+        // lifecycle, never by silence detection or audio diffing.
+        //
+        // AudioManager.AudioPlaybackCallback is NOT usable here: AudioPlaybackConfiguration
+        // exposes no UID accessor to third-party apps on modern API levels (only
+        // getAudioAttributes/getAudioDeviceInfo are public), so UID matching via reflection
+        // silently always fails and the capture state can never leave PAUSED.
+        // MediaSessionManager + MediaController.Callback is the public, supported surface,
+        // and we already hold the required notification-listener binding.
+        registerPlaybackSessionCallbacks()
 
         telemetryCollector.markCaptureRequested()
         buildAndStartAudioRecord(targetUid)
+    }
+
+    private fun registerPlaybackSessionCallbacks() {
+        val msm = getSystemService(Context.MEDIA_SESSION_SERVICE) as? MediaSessionManager ?: run {
+            Log.w(TAG, "MediaSessionManager unavailable; pause/resume detection disabled")
+            return
+        }
+        val listenerComponent = ComponentName(this, MediaNotificationListenerService::class.java)
+
+        val sessionsListener = MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
+            attachToTargetSession(controllers)
+        }
+        activeSessionsListener = sessionsListener
+        try {
+            msm.addOnActiveSessionsChangedListener(sessionsListener, listenerComponent, Handler(Looper.getMainLooper()))
+            attachToTargetSession(msm.getActiveSessions(listenerComponent))
+        } catch (e: Exception) {
+            Log.w(TAG, "Unable to register session listener: ${e.message}")
+        }
+    }
+
+    private fun attachToTargetSession(controllers: List<MediaController>?) {
+        val target = controllers?.firstOrNull { controller ->
+            try {
+                packageManager.getPackageInfo(controller.packageName, 0).applicationInfo.uid == activeTargetUid
+            } catch (_: Exception) { false }
+        }
+        if (target == null) {
+            // No session for the target app: it is not publishing playback -> paused.
+            applyPlaybackActive(false)
+            return
+        }
+        if (target.packageName == attachedSessionPackage) return
+
+        sessionCallback?.let { cb -> attachedController?.unregisterCallback(cb) }
+        val cb = object : MediaController.Callback() {
+            override fun onPlaybackStateChanged(state: PlaybackState?) {
+                val playing = state?.state == PlaybackState.STATE_PLAYING ||
+                    state?.state == PlaybackState.STATE_BUFFERING
+                applyPlaybackActive(playing)
+            }
+            override fun onSessionDestroyed() {
+                applyPlaybackActive(false)
+            }
+        }
+        sessionCallback = cb
+        attachedController = target
+        attachedSessionPackage = target.packageName
+        target.registerCallback(cb, Handler(Looper.getMainLooper()))
+
+        val s = target.playbackState?.state
+        applyPlaybackActive(s == PlaybackState.STATE_PLAYING || s == PlaybackState.STATE_BUFFERING)
+    }
+
+    private fun applyPlaybackActive(active: Boolean) {
+        if (!active && currentState == CaptureState.CAPTURING) {
+            currentState = CaptureState.PAUSED
+            updateNotification("Paused: target playback stopped/paused")
+            Log.i(TAG, "Target UID $activeTargetUid playback stopped/paused -> PAUSED")
+        } else if (active && currentState == CaptureState.PAUSED) {
+            currentState = CaptureState.CAPTURING
+            updateNotification("Testing candidate capture against: $targetAppLabel")
+            Log.i(TAG, "Target UID $activeTargetUid playback resumed -> CAPTURING")
+        }
     }
 
     private fun buildAndStartAudioRecord(targetUid: Int) {
@@ -319,16 +356,27 @@ class CandidateCaptureService : Service() {
             telemetryCollector.recordFailure(reasonCode)
         }
 
-        // Unregister audio playback callback
-        playbackCallback?.let {
+        // Unregister playback-session callbacks
+        sessionCallback?.let {
             try {
-                val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-                audioManager?.unregisterAudioPlaybackCallback(it)
+                attachedController?.unregisterCallback(it)
             } catch (e: Exception) {
-                Log.w(TAG, "Error unregistering AudioPlaybackCallback: ${e.message}")
+                Log.w(TAG, "Error unregistering MediaController.Callback: ${e.message}")
             }
-            playbackCallback = null
+            sessionCallback = null
         }
+        attachedController = null
+        attachedSessionPackage = null
+        activeSessionsListener?.let {
+            try {
+                val msm = getSystemService(Context.MEDIA_SESSION_SERVICE) as? MediaSessionManager
+                msm?.removeOnActiveSessionsChangedListener(it)
+            } catch (e: Exception) {
+                Log.w(TAG, "Error removing active-sessions listener: ${e.message}")
+            }
+            activeSessionsListener = null
+        }
+        activeSessionsListener = null
 
         // Unregister projectionCallback BEFORE stopping mediaProjection to prevent false F-02
         projectionCallback?.let {
