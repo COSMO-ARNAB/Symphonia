@@ -16,5 +16,7 @@ android {
 
 dependencies {
     api(project(":gate2:contracts"))
+    api("org.java-websocket:Java-WebSocket:1.5.7")
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20231013")
 }

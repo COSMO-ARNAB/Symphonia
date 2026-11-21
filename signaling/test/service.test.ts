@@ -20,7 +20,7 @@ describe("SignalingService", () => {
     const host = new Peer("host");
     const listener = new Peer("listener");
     const created = await service.handle(host, request("1", "CREATE_ROOM", { displayName: "Host" })) as { roomId: string; localPrototypeOnly: boolean };
-    assert.match(created.roomId, /^[A-Za-z0-9_-]{43}$/);
+    assert.match(created.roomId, /^[0-9A-Z]{6}$/);
     assert.equal(created.localPrototypeOnly, true);
     await service.handle(listener, request("2", "JOIN_ROOM", { roomId: created.roomId, displayName: "Listener" }));
     assert.equal(host.messages.at(-1)?.type, "PARTICIPANT_CONNECTED");
@@ -204,5 +204,24 @@ describe("SignalingService", () => {
     delete factory.rooms[0]!.createTransportGate;
     const transport = await service.handle(host, request("3", "CREATE_WEBRTC_TRANSPORT", { direction: "send" })) as { id: string };
     assert.match(transport.id, /^transport-/);
+  });
+
+  it("tracks pending room IDs to prevent concurrent collision gaps", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const factory = new FakeSfuFactory();
+    factory.createRoomGate = gate;
+    const service = new SignalingService(factory);
+    const host1 = new Peer("host-1");
+    const host2 = new Peer("host-2");
+
+    const pending1 = service.handle(host1, request("1", "CREATE_ROOM"));
+    const pending2 = service.handle(host2, request("2", "CREATE_ROOM"));
+
+    release();
+    const [res1, res2] = await Promise.all([pending1, pending2]) as [{ roomId: string }, { roomId: string }];
+    assert.match(res1.roomId, /^[0-9A-Z]{6}$/);
+    assert.match(res2.roomId, /^[0-9A-Z]{6}$/);
+    assert.notEqual(res1.roomId, res2.roomId);
   });
 });

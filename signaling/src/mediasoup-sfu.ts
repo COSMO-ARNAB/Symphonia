@@ -8,7 +8,14 @@ const mediaCodecs = [{
   mimeType: "audio/opus",
   clockRate: 48_000,
   channels: 2,
-  parameters: { useinbandfec: 1, minptime: 10 }
+  parameters: {
+    useinbandfec: 1,
+    minptime: 10,
+    stereo: 1,
+    "sprop-stereo": 1,
+    cbr: 1,
+    maxaveragebitrate: 96000
+  }
 }];
 
 export interface MediasoupSfuOptions { listenIp: string; announcedAddress?: string; port: number }

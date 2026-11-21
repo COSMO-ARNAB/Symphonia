@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { randomInt, randomUUID } from "node:crypto";
 import type { ClientRequest, ServerMessage } from "./protocol.js";
 import { ProtocolFailure } from "./protocol.js";
 import type { RoomSfu, SfuFactory } from "./sfu.js";
@@ -21,12 +21,23 @@ interface Room {
 const MAX_LISTENERS = 30;
 const MAX_ROOMS = 16;
 const DEFAULT_SFU_OPERATION_TIMEOUT_MS = 10_000;
+const ROOM_ID_CHARSET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const ROOM_ID_LENGTH = 6;
 
 export class SignalingService {
   private readonly rooms = new Map<string, Room>();
   private readonly connectionRooms = new Map<string, string>();
   private readonly disconnected = new WeakSet<ClientPeer>();
-  private pendingRooms = 0;
+  private readonly pendingRoomIds = new Set<string>();
+
+  private generateRoomId(): string {
+    let id = "";
+    for (let i = 0; i < ROOM_ID_LENGTH; i++) {
+      const index = randomInt(0, ROOM_ID_CHARSET.length);
+      id += ROOM_ID_CHARSET.charAt(index);
+    }
+    return id;
+  }
 
   constructor(private readonly sfuFactory: SfuFactory, private readonly sfuOperationTimeoutMs = DEFAULT_SFU_OPERATION_TIMEOUT_MS) {}
 
@@ -57,6 +68,7 @@ export class SignalingService {
   async close(): Promise<void> {
     for (const room of this.rooms.values()) room.sfu.close();
     this.rooms.clear();
+    this.pendingRoomIds.clear();
     this.connectionRooms.clear();
     await this.sfuFactory.close();
   }
@@ -74,12 +86,15 @@ export class SignalingService {
   private async createRoom(peer: ClientPeer, displayName?: string) {
     this.ensureNotJoined(peer);
     this.ensureConnected(peer);
-    if (this.rooms.size + this.pendingRooms >= MAX_ROOMS) throw new ProtocolFailure("N-ROOM_FULL", `Prototype room limit of ${MAX_ROOMS} reached`);
-    this.pendingRooms++;
-    const id = randomBytes(32).toString("base64url");
+    if (this.rooms.size + this.pendingRoomIds.size >= MAX_ROOMS) throw new ProtocolFailure("N-ROOM_FULL", `Prototype room limit of ${MAX_ROOMS} reached`);
+    let id: string;
+    do {
+      id = this.generateRoomId();
+    } while (this.rooms.has(id) || this.pendingRoomIds.has(id));
+    this.pendingRoomIds.add(id);
     let sfu: RoomSfu;
     try { sfu = await this.withSfuFailure((signal) => this.sfuFactory.createRoom(id, signal)); }
-    finally { this.pendingRooms--; }
+    finally { this.pendingRoomIds.delete(id); }
     if (this.disconnected.has(peer)) { sfu.close(); throw new ProtocolFailure("N-NOT_IN_ROOM", "Connection closed before room creation completed"); }
     const participant = this.participant(peer, "HOST", displayName);
     const room: Room = { id, sfu, participants: new Map([[participant.id, participant]]), hostId: participant.id, state: { state: "STOPPED" }, producing: false, pendingConsumers: 0 };

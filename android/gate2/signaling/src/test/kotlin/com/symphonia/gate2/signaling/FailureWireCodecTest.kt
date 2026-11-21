@@ -61,7 +61,7 @@ class FailureWireCodecTest {
     fun `signed room token and join message redact secrets`() {
         val secret = "header.payload.signature"
         val token = com.symphonia.gate2.contracts.SignedRoomToken(secret)
-        val join = JoinRoom("message-1", com.symphonia.gate2.contracts.RoomId("room-1"), token, com.symphonia.gate2.contracts.GuestId("guest-1"))
+        val join = JoinRoom("message-1", com.symphonia.gate2.contracts.RoomId("ROOM01"), token, com.symphonia.gate2.contracts.GuestId("guest-1"))
 
         assertFalse(token.toString().contains(secret))
         assertFalse(join.toString().contains(secret))
@@ -84,7 +84,7 @@ class FailureWireCodecTest {
     @Test(expected = IllegalArgumentException::class)
     fun `share state requires stopped reason exactly when stopped`() {
         ShareStateChanged(
-            "message-2", com.symphonia.gate2.contracts.RoomId("room-1"),
+            "message-2", com.symphonia.gate2.contracts.RoomId("ROOM01"),
             com.symphonia.gate2.contracts.ShareState.STOPPED, "Player", null,
         )
     }
@@ -92,7 +92,7 @@ class FailureWireCodecTest {
     @Test(expected = IllegalArgumentException::class)
     fun `room grace expiry is rejected outside grace state`() {
         RoomStateChanged(
-            "message-3", com.symphonia.gate2.contracts.RoomId("room-1"),
+            "message-3", com.symphonia.gate2.contracts.RoomId("ROOM01"),
             com.symphonia.gate2.contracts.RoomState.ACTIVE, 100,
         )
     }
@@ -100,7 +100,7 @@ class FailureWireCodecTest {
     @Test(expected = IllegalArgumentException::class)
     fun `unsupported protocol version is rejected`() {
         ParticipantChanged(
-            "message-4", com.symphonia.gate2.contracts.RoomId("room-1"),
+            "message-4", com.symphonia.gate2.contracts.RoomId("ROOM01"),
             com.symphonia.gate2.contracts.GuestId("guest-1"), com.symphonia.gate2.contracts.ParticipantRole.LISTENER,
             com.symphonia.gate2.contracts.ConnectionState.CONNECTED, protocolVersion = 2,
         )

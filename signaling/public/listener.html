@@ -18,11 +18,11 @@
 <h2>Symphonia Gate2 Spike — Listener (throwaway)</h2>
 <p class="hint">Chrome on the laptop. Join the room created by the phone (Speaker) and listen.</p>
 
-<label for="room">Room ID (from the phone's log line "room created: …")</label>
-<input id="room" placeholder="paste full room id" autocomplete="off" />
-<button id="join">JOIN &amp; LISTEN</button>
+<label for="room">Room PIN (6 uppercase letters/digits)</label>
+<input id="room" placeholder="e.g. A1B2C3" maxlength="6" autocomplete="off" />
+<button id="join" style="font-size: 16px; padding: 10px 20px; font-weight: bold; background: #0066cc; color: #fff; border: none; border-radius: 4px;">JOIN &amp; LISTEN (CLICK HERE)</button>
 <button id="paste" type="button">PASTE ROOM ID</button>
-<div id="status">idle</div>
+<div id="status" style="font-size: 18px; color: #d00;">idle</div>
 <div id="log"></div>
 
 <script type="module">
@@ -35,6 +35,18 @@ const { Device } = mediasoupClient;
   const log = (m) => { logEl.textContent += m + '\n'; };
   const setStatus = (s) => { statusEl.textContent = s; };
 
+  const roomInput = document.getElementById('room');
+  roomInput.addEventListener('input', () => {
+    roomInput.value = roomInput.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
+  });
+
+  const params = new URLSearchParams(window.location.search);
+  const initialRoom = (params.get('roomId') || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
+  if (initialRoom) {
+    document.getElementById('room').value = initialRoom;
+    setTimeout(() => { document.getElementById('join').click(); }, 300);
+  }
+
   document.getElementById('join').onclick = () => main().catch((e) => {
     setStatus('FAILED: ' + e.message);
     log('ERROR ' + (e && e.stack ? e.stack : e));
@@ -44,18 +56,22 @@ const { Device } = mediasoupClient;
     try {
       const text = (await navigator.clipboard.readText()).trim();
       if (!text) { log('clipboard is empty'); return; }
-      document.getElementById('room').value = text;
-      log('pasted room id (' + text.slice(0, 8) + '…) from clipboard');
+      const normalized = text.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
+      document.getElementById('room').value = normalized;
+      log('pasted room id (' + normalized + ') from clipboard');
     } catch (e) {
       log('clipboard read blocked (' + e.message + ') - paste manually with Ctrl+V');
     }
   };
 
   async function main() {
-    const room = document.getElementById('room').value.trim();
-    if (!room) throw new Error('paste the room id from the phone first');
+    const room = document.getElementById('room').value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
+    document.getElementById('room').value = room;
+    if (!/^[A-Z0-9]{6}$/.test(room)) {
+      throw new Error('Enter a valid 6-character room PIN (e.g. A1B2C3)');
+    }
     setStatus('connecting…');
-    log('join room ' + room.slice(0, 8) + '…');
+    log('join room ' + room);
 
     const device = new Device();
 
@@ -139,6 +155,16 @@ const { Device } = mediasoupClient;
     await request('RESUME_CONSUMER', { consumerId: consumer.id });
     log('consumer resumed - attaching track…');
 
+    // Low-latency jitter buffer configuration (strip artificial buffering)
+    if (consumer.rtpReceiver) {
+      if ('playoutDelayHint' in consumer.rtpReceiver) {
+        consumer.rtpReceiver.playoutDelayHint = 0;
+      }
+      if ('jitterBufferTarget' in consumer.rtpReceiver) {
+        consumer.rtpReceiver.jitterBufferTarget = 0;
+      }
+    }
+
     // THROWAWAY spike diagnostics: expose transport/consumer + poll RTP stats
     window.__spike = { recv, consumer, device };
     const statTimer = setInterval(async () => {
@@ -154,13 +180,35 @@ const { Device } = mediasoupClient;
     }, 3000);
 
     const track = consumer.track;
+    if ('contentHint' in track) {
+      track.contentHint = 'music';
+    }
     const stream = new MediaStream([track]);
-    const audio = document.createElement('audio');
-    audio.srcObject = stream;
-    audio.autoplay = true;
-    document.body.appendChild(audio);
-    // Chrome autoplay policy: the JOIN click is the user gesture, so play() resolves.
-    try { await audio.play(); } catch (e) { log('autoplay blocked (' + e.message + ') - click the page once'); }
+
+    // Low-latency Web Audio output pipeline
+    try {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      const audioCtx = new AudioCtx({ latencyHint: 'interactive', sampleRate: 48000 });
+      if (audioCtx.state === 'suspended') {
+        await audioCtx.resume();
+      }
+      const source = audioCtx.createMediaStreamSource(stream);
+      source.connect(audioCtx.destination);
+      log('audio connected to low-latency Web Audio graph (latencyHint: interactive)');
+
+      // Keep muted fallback audio element to maintain active media stream pull in Chrome
+      const dummyAudio = document.createElement('audio');
+      dummyAudio.srcObject = stream;
+      dummyAudio.muted = true;
+      dummyAudio.play().catch(() => {});
+    } catch (e) {
+      log('Web Audio failed (' + e.message + ') - falling back to HTMLAudioElement');
+      const audio = document.createElement('audio');
+      audio.srcObject = stream;
+      audio.autoplay = true;
+      document.body.appendChild(audio);
+      try { await audio.play(); } catch (err) { log('autoplay blocked (' + err.message + ')'); }
+    }
     consumer.on('transportclose', () => setStatus('transport closed'));
 
     setStatus('LISTENING - audio should be playing from laptop speakers');

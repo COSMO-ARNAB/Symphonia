@@ -2,7 +2,7 @@
 
 Minimal Node/TypeScript WebSocket signaling and mediasoup SFU prototype for one audio publisher and up to 30 listeners per room.
 
-> **Local prototype only:** authentication and signed room tokens are intentionally not implemented for this Gate 2 exercise. Rooms use cryptographically random 256-bit, URL-safe IDs to avoid guessable identifiers, but that is not authentication. Do not expose this service to the public internet or treat it as satisfying the production room-token requirements.
+> **Local prototype only:** authentication and signed room tokens (`SignedRoomToken`) are intentionally not implemented for this Gate 2 exercise. Rooms use 6-character uppercase alphanumeric PIN codes (`[0-9A-Z]`) generated with zero cryptographic bias (`randomInt` + `.charAt()`) with collision protection. In production, manual PIN entry requires server-side rate-limiting on failed `JOIN_ROOM` attempts (`N-ROOM_NOT_FOUND`), and invite links use signed cryptographic tokens. Do not expose this unthrottled, unauthenticated service to the public internet.
 
 ## Guarantees and scope
 
@@ -82,7 +82,7 @@ Requests use a correlated envelope:
 Success and failure responses:
 
 ```json
-{"id":"req-1","type":"RESPONSE","ok":true,"data":{"roomId":"..."}}
+{"id":"req-1","type":"RESPONSE","ok":true,"data":{"roomId":"A1B2C3"}}
 {"id":"req-2","type":"RESPONSE","ok":false,"error":{"code":"N-FORBIDDEN","message":"..."}}
 ```
 

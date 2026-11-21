@@ -3,6 +3,8 @@ package com.symphonia.gate2.prototype.harness
 import android.media.AudioManager
 import android.media.AudioPlaybackConfiguration
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import com.symphonia.gate2.contracts.Gate2Failure
 import com.symphonia.gate2.contracts.ShareStoppedReason
@@ -30,7 +32,9 @@ import kotlinx.coroutines.flow.asStateFlow
  *  - Opus, 48 kHz, stereo where source provides it, 64-96 kbps (server-tunable)
  */
 class Gate2CaptureController(
-    private val audioManager: AudioManager,
+    private val audioManager: AudioManager? = null,
+    private val pauseDebounceMs: Long = 0L,
+    private val mainHandler: Handler? = null,
 ) {
     companion object {
         private const val TAG = "Gate2CaptureCtl"
@@ -39,6 +43,7 @@ class Gate2CaptureController(
         const val CHANNEL_COUNT_MONO = 1
         const val PCM_CHUNK_MS = 10 // WebRTC expects 10/20ms chunks
         const val QUEUE_CAPACITY_FRAMES = 100 // ~1 second at 10ms stereo
+        const val DEFAULT_PAUSE_DEBOUNCE_MS = 1500L
     }
 
     sealed interface CaptureState {
@@ -51,6 +56,17 @@ class Gate2CaptureController(
 
     private val _state = MutableStateFlow<CaptureState>(CaptureState.Idle)
     val state: StateFlow<CaptureState> = _state.asStateFlow()
+
+    var onStateChanged: ((CaptureState) -> Unit)? = null
+
+    private fun updateState(newState: CaptureState) {
+        _state.value = newState
+        onStateChanged?.invoke(newState)
+    }
+
+    private val handler: Handler? = mainHandler ?: runCatching { Handler(Looper.getMainLooper()) }.getOrNull()
+    private var isMediaSessionPlaying: Boolean = false
+    private var pendingPauseRunnable: Runnable? = null
 
     // PCM pipeline - bounded, validated, correctly paced
     private val pcmFormatStereo = PcmFormat(sampleRateHz = SAMPLE_RATE_HZ, channelCount = CHANNEL_COUNT_STEREO)
@@ -76,13 +92,12 @@ class Gate2CaptureController(
      * Fail-closed: if uid is -1 or appLabel blank, immediately STOPPED.
      */
     fun requestCapture(appLabel: String, uid: Int): CaptureState {
-        require(appLabel.isNotBlank() || uid == -1) // allow blank only for failure path
         if (uid == -1 || appLabel.isBlank()) {
             val stopped = CaptureState.Stopped(
                 reason = ShareStoppedReason.CAPTURE_UNAVAILABLE,
                 failure = Gate2Failure.CAPTURE_SOURCE_UNAVAILABLE
             )
-            _state.value = stopped
+            updateState(stopped)
             Log.w(TAG, "Fail-closed: invalid capture target uid=$uid label=$appLabel -> STOPPED")
             return stopped
         }
@@ -94,7 +109,7 @@ class Gate2CaptureController(
         totalOfferedFrames = 0
         totalDroppedFrames = 0
         captureStartRealtimeNanos = -1
-        _state.value = CaptureState.RequestingCapture
+        updateState(CaptureState.RequestingCapture)
         registerPlaybackCallbackIfNeeded()
         Log.i(TAG, "Capture requested for $appLabel uid=$uid -> REQUESTING_CAPTURE")
         return _state.value
@@ -106,10 +121,12 @@ class Gate2CaptureController(
     fun onCaptureStarted(realtimeNanos: Long) {
         captureStartRealtimeNanos = realtimeNanos
         capturingFlag = true
-        _state.value = CaptureState.Capturing(
-            appLabel = targetAppLabel,
-            targetUid = targetUid,
-            startedAtMs = System.currentTimeMillis()
+        updateState(
+            CaptureState.Capturing(
+                appLabel = targetAppLabel,
+                targetUid = targetUid,
+                startedAtMs = System.currentTimeMillis()
+            )
         )
         Log.i(TAG, "Capture started for $targetAppLabel -> CAPTURING at $realtimeNanos")
     }
@@ -117,6 +134,9 @@ class Gate2CaptureController(
     /**
      * OS-lifecycle driven pause/resume. Called from AudioManager.AudioPlaybackCallback.
      * Never uses silence detection - per AGENTS.md "No silence-detection or audio-diffing".
+     *
+     * Fix 4: Checks getPlayerState() == 2 (started) alongside clientUid == targetUid to detect
+     * genuine PAUSED state when playback stops.
      */
     fun onPlaybackConfigsChanged(configs: List<AudioPlaybackConfiguration>) {
         val current = _state.value
@@ -125,37 +145,101 @@ class Gate2CaptureController(
 
         val targetActive = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             configs.any { cfg ->
-                // Use reflection for getClientUid to avoid compile-time API variance / hidden API
-                try {
+                val uidMatches = try {
                     val method = cfg.javaClass.getMethod("getClientUid")
                     val uid = method.invoke(cfg) as Int
                     uid == targetUid
                 } catch (_: Exception) {
                     try {
-                        // Fallback: try field "mClientUid" via reflection if method hidden
                         val field = cfg.javaClass.getDeclaredField("mClientUid")
                         field.isAccessible = true
                         (field.get(cfg) as Int) == targetUid
                     } catch (_: Exception) { false }
                 }
+
+                val isStarted = try {
+                    val getPlayerState = cfg.javaClass.getMethod("getPlayerState")
+                    val state = getPlayerState.invoke(cfg) as Int
+                    // 2 = PLAYER_STATE_STARTED, 5 = PLAYER_STATE_DUCKED (ducked is active playback, not paused!)
+                    state == 2 || state == 5
+                } catch (_: Exception) {
+                    try {
+                        val isActiveMethod = cfg.javaClass.getMethod("isActive")
+                        isActiveMethod.invoke(cfg) as Boolean
+                    } catch (_: Exception) {
+                        true
+                    }
+                }
+
+                uidMatches && isStarted
             }
         } else {
-            // Pre-O fallback: we cannot reliably query, so we don't auto-pause.
-            // Keep CAPTURING and let explicit stop handle it - fail-closed still holds
-            // because we never widen, but we won't incorrectly PAUSE.
             true
         }
 
-        if (!targetActive && current is CaptureState.Capturing) {
-            _state.value = CaptureState.Paused(appLabel = targetAppLabel, targetUid = targetUid)
-            Log.i(TAG, "Playback config: target uid $targetUid no longer active -> PAUSED (app switch)")
-        } else if (targetActive && current is CaptureState.Paused) {
-            _state.value = CaptureState.Capturing(
-                appLabel = targetAppLabel,
-                targetUid = targetUid,
-                startedAtMs = System.currentTimeMillis()
-            )
-            Log.i(TAG, "Playback config: target uid $targetUid active again -> CAPTURING (auto-resume)")
+        applyPlaybackActive(targetActive, fromMediaSession = false)
+    }
+
+    /**
+     * Directly updates capture state based on OS playback lifecycle (e.g. MediaSessionManager
+     * or AudioPlaybackCallback). Transitions CAPTURING <-> PAUSED without silence detection.
+     *
+     * Debounces inactive transitions by 1500ms to avoid false pauses during
+     * volume changes, AudioTrack recreations, ducking, or routing transitions.
+     */
+    fun applyPlaybackActive(active: Boolean, fromMediaSession: Boolean = false) {
+        if (fromMediaSession) {
+            isMediaSessionPlaying = active
+        }
+
+        val effectiveActive = active || isMediaSessionPlaying
+
+        if (effectiveActive) {
+            cancelPendingPause()
+            val current = _state.value
+            if (current is CaptureState.Paused) {
+                updateState(
+                    CaptureState.Capturing(
+                        appLabel = targetAppLabel,
+                        targetUid = targetUid,
+                        startedAtMs = System.currentTimeMillis()
+                    )
+                )
+                Log.i(TAG, "Playback active=true -> CAPTURING (auto-resume, mediaSession=$isMediaSessionPlaying)")
+            }
+        } else {
+            if (isMediaSessionPlaying) {
+                Log.d(TAG, "Ignoring inactive playback callback because MediaSession is actively playing")
+                return
+            }
+
+            val current = _state.value
+            if (current is CaptureState.Capturing && pendingPauseRunnable == null) {
+                val runnable = Runnable {
+                    pendingPauseRunnable = null
+                    val stateNow = _state.value
+                    if (!isMediaSessionPlaying && stateNow is CaptureState.Capturing) {
+                        updateState(CaptureState.Paused(appLabel = targetAppLabel, targetUid = targetUid))
+                        Log.i(TAG, "Playback active=false confirmed after debounce -> PAUSED")
+                    }
+                }
+                val h = handler
+                if (pauseDebounceMs <= 0L || h == null) {
+                    runnable.run()
+                } else {
+                    pendingPauseRunnable = runnable
+                    h.postDelayed(runnable, pauseDebounceMs)
+                    Log.d(TAG, "Scheduled PAUSED transition with ${pauseDebounceMs}ms debounce")
+                }
+            }
+        }
+    }
+
+    private fun cancelPendingPause() {
+        pendingPauseRunnable?.let { runnable ->
+            handler?.removeCallbacks(runnable)
+            pendingPauseRunnable = null
+            Log.d(TAG, "Cancelled pending PAUSED transition")
         }
     }
 
@@ -163,26 +247,36 @@ class Gate2CaptureController(
      * Permission revoked or service error - distinct from app-switch pause.
      */
     fun onPermissionRevoked() {
+        cancelPendingPause()
+        isMediaSessionPlaying = false
         unregisterPlaybackCallback()
-        _state.value = CaptureState.Stopped(
-            reason = ShareStoppedReason.PERMISSION_REQUIRED,
-            failure = Gate2Failure.CAPTURE_PERMISSION_REQUIRED
+        updateState(
+            CaptureState.Stopped(
+                reason = ShareStoppedReason.PERMISSION_REQUIRED,
+                failure = Gate2Failure.CAPTURE_PERMISSION_REQUIRED
+            )
         )
         capturingFlag = false
         Log.w(TAG, "Permission revoked -> STOPPED(permission_required)")
     }
 
     fun onCaptureUnavailable(failure: Gate2Failure = Gate2Failure.CAPTURE_SOURCE_UNAVAILABLE) {
+        cancelPendingPause()
+        isMediaSessionPlaying = false
         unregisterPlaybackCallback()
-        _state.value = CaptureState.Stopped(
-            reason = ShareStoppedReason.CAPTURE_UNAVAILABLE,
-            failure = failure
+        updateState(
+            CaptureState.Stopped(
+                reason = ShareStoppedReason.CAPTURE_UNAVAILABLE,
+                failure = failure
+            )
         )
         capturingFlag = false
         Log.w(TAG, "Capture unavailable $failure -> STOPPED")
     }
 
     fun stopCapture(reason: ShareStoppedReason = ShareStoppedReason.HOST_ENDED) {
+        cancelPendingPause()
+        isMediaSessionPlaying = false
         unregisterPlaybackCallback()
         capturingFlag = false
         // Map reason to failure for diagnostics
@@ -191,19 +285,32 @@ class Gate2CaptureController(
             ShareStoppedReason.CAPTURE_UNAVAILABLE -> Gate2Failure.CAPTURE_SOURCE_UNAVAILABLE
             else -> null
         }
-        _state.value = CaptureState.Stopped(reason = reason, failure = failure)
+        updateState(CaptureState.Stopped(reason = reason, failure = failure))
         queue.clear()
         Log.i(TAG, "Capture stopped reason=$reason")
     }
 
     fun resetToIdle() {
+        cancelPendingPause()
+        isMediaSessionPlaying = false
         unregisterPlaybackCallback()
-        _state.value = CaptureState.Idle
+        updateState(CaptureState.Idle)
         targetUid = -1
         targetAppLabel = ""
         queue.clear()
         capturingFlag = false
         Log.i(TAG, "Controller reset -> IDLE")
+    }
+
+    /**
+     * PCM ingestion from WebRTC SamplesReadyCallback (Fix 1).
+     * Converts byte[] PCM_16BIT directly into ShortArray and feeds into the pipeline.
+     */
+    fun onPcmCaptured(data: ByteArray, sampleRateHz: Int, channelCount: Int, capturedAtNanos: Long = android.os.SystemClock.elapsedRealtimeNanos()) {
+        if (!capturingFlag) return
+        val shorts = ShortArray(data.size / 2)
+        java.nio.ByteBuffer.wrap(data).order(java.nio.ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(shorts)
+        onPcmCaptured(shorts, PcmFormat(sampleRateHz, channelCount), capturedAtNanos)
     }
 
     /**
@@ -262,6 +369,14 @@ class Gate2CaptureController(
      */
     fun pollForInjection(): PcmFrame? = queue.poll()
 
+    /**
+     * Drains all queued frames to prevent overflow when monitoring PCM frames
+     * via WebRTC SamplesReadyCallback without a manual injection consumer.
+     */
+    fun drainQueue() {
+        while (queue.poll() != null) {}
+    }
+
     fun queueSize(): Int = queue.size()
 
     fun isCapturing(): Boolean = capturingFlag && _state.value is CaptureState.Capturing
@@ -275,7 +390,7 @@ class Gate2CaptureController(
         }
         playbackCallback = cb
         try {
-            audioManager.registerAudioPlaybackCallback(cb, null)
+            audioManager?.registerAudioPlaybackCallback(cb, null)
             Log.i(TAG, "Registered AudioPlaybackCallback for uid=$targetUid")
         } catch (e: Exception) {
             Log.w(TAG, "Failed to register AudioPlaybackCallback: ${e.message}")
@@ -285,7 +400,7 @@ class Gate2CaptureController(
 
     private fun unregisterPlaybackCallback() {
         playbackCallback?.let {
-            try { audioManager.unregisterAudioPlaybackCallback(it) } catch (_: Exception) {}
+            try { audioManager?.unregisterAudioPlaybackCallback(it) } catch (_: Exception) {}
             Log.i(TAG, "Unregistered AudioPlaybackCallback")
         }
         playbackCallback = null

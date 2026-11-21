@@ -6,42 +6,45 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
-import android.media.AudioFormat
 import android.media.AudioManager
-import android.media.AudioPlaybackCaptureConfiguration
-import android.media.AudioRecord
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.media.session.MediaController
+import android.media.session.MediaSessionManager
+import android.media.session.PlaybackState
 import android.os.Binder
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.symphonia.gate2.contracts.Gate2Failure
 import com.symphonia.gate2.contracts.ShareStoppedReason
-import com.symphonia.gate2.pcm.PcmFormat
+import com.symphonia.gate2.transport.MediasoupSpeakerTransport
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Gate 2 Prototype Capture Service - explicitly prototype-named.
+ * Gate 2 Prototype Capture Service - Speaker foreground service.
  *
- * Minimal runnable harness service implementing fail-closed AudioPlaybackCapture
- * with foreground notification. This is NOT production code - it is the Gate 2
- * feasibility experiment harness. Named explicitly to prevent confusion with
- * future production pipeline.
- *
- * Guarantees per AGENTS.md:
- *  - No P2P mesh (SFU only - enforced at transport layer, not here)
- *  - No silence detection (pause/resume via AudioManager callback in controller)
- *  - Never widens capture scope - if UID invalid or config fails -> STOPPED
- *  - Capture scope enforced at source via AudioPlaybackCaptureConfiguration.addMatchingUid
- *  - UI decoupled - activity binds but does not drive capture beyond intents
- *  - 48 kHz Opus baseline, 10ms rechunking, bounded queue
- *  - Persistent notification with Stop Sharing action (PRD §7.8)
+ * Implements:
+ *  - Fail-closed app-scoped capture via MediaProjection and MediasoupSpeakerTransport.
+ *  - Android 14 compliant foreground service startup order.
+ *  - Fix 1: Eliminates manual AudioRecord read thread; WebRTC's read thread forwards
+ *    10ms PCM frames directly to captureController.onPcmCaptured(...).
+ *  - Fix 4: Immediate MediaProjection.Callback registration upon getMediaProjection(),
+ *    and unregistration prior to mediaProjection.stop().
+ *  - OS-lifecycle pause/resume synchronization with WebRTC Producer.
  */
 class Gate2PrototypeCaptureService : Service() {
 
@@ -54,6 +57,7 @@ class Gate2PrototypeCaptureService : Service() {
         const val EXTRA_TARGET_UID = "extra_target_uid"
         const val EXTRA_TARGET_APP_LABEL = "extra_target_app_label"
         const val EXTRA_ROOM_ID = "extra_room_id"
+        const val EXTRA_SERVER_URL = "extra_server_url"
         const val ACTION_STOP_CAPTURE = "com.symphonia.gate2.prototype.harness.ACTION_STOP_CAPTURE"
 
         private fun createStopIntent(context: Context): Intent =
@@ -66,9 +70,21 @@ class Gate2PrototypeCaptureService : Service() {
 
     private val binder = LocalBinder()
     private var mediaProjection: MediaProjection? = null
-    private var audioRecord: AudioRecord? = null
-    private var captureThread: Thread? = null
-    private val isCapturing = AtomicBoolean(false)
+    private var mediaProjectionCallback: MediaProjection.Callback? = null
+    private val isCapturingAtomic = AtomicBoolean(false)
+    val isCapturing: Boolean
+        get() = isCapturingAtomic.get()
+
+    private var activeSessionsListener: MediaSessionManager.OnActiveSessionsChangedListener? = null
+    private var sessionCallback: MediaController.Callback? = null
+    private var attachedController: MediaController? = null
+    private var volumeReceiver: BroadcastReceiver? = null
+
+    var sessionStartTimeMs: Long = 0L
+        private set
+
+    var speakerTransport: MediasoupSpeakerTransport? = null
+        private set
 
     lateinit var captureController: Gate2CaptureController
         private set
@@ -81,12 +97,35 @@ class Gate2PrototypeCaptureService : Service() {
         private set
     var roomIdForNotification: String = "No Room"
         private set
+    private val _currentRoomId = MutableStateFlow<String?>(null)
+    val currentRoomId: StateFlow<String?> = _currentRoomId.asStateFlow()
+    var serverUrl: String = "ws://10.0.2.2:3000/gate2"
+        private set
 
     override fun onCreate() {
         super.onCreate()
         val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        captureController = Gate2CaptureController(am)
+        captureController = Gate2CaptureController(am, pauseDebounceMs = Gate2CaptureController.DEFAULT_PAUSE_DEBOUNCE_MS)
         telemetry = Gate2PrototypeTelemetryCollector(applicationContext)
+
+        captureController.onStateChanged = { state ->
+            when (state) {
+                is Gate2CaptureController.CaptureState.Paused -> {
+                    speakerTransport?.pause()
+                    updateNotification()
+                }
+                is Gate2CaptureController.CaptureState.Capturing -> {
+                    speakerTransport?.resume()
+                    updateNotification()
+                }
+                is Gate2CaptureController.CaptureState.Stopped -> {
+                    speakerTransport?.close()
+                    updateNotification()
+                }
+                else -> updateNotification()
+            }
+        }
+
         createNotificationChannel()
         Log.i(TAG, "Gate2 prototype service created - env ${telemetry.environment}")
     }
@@ -109,16 +148,14 @@ class Gate2PrototypeCaptureService : Service() {
         targetUid = intent?.getIntExtra(EXTRA_TARGET_UID, -1) ?: -1
         targetAppLabel = intent?.getStringExtra(EXTRA_TARGET_APP_LABEL) ?: "Unknown"
         roomIdForNotification = intent?.getStringExtra(EXTRA_ROOM_ID) ?: "Gate2-Room"
+        serverUrl = intent?.getStringExtra(EXTRA_SERVER_URL) ?: "ws://10.0.2.2:3000/gate2"
 
         if (resultData != null && targetUid != -1) {
-            // Valid target - request capture via controller (fail-closed enforced inside)
             val state = captureController.requestCapture(targetAppLabel, targetUid)
             if (state is Gate2CaptureController.CaptureState.Stopped) {
-                // Fail-closed: do not attempt AudioRecord
                 telemetry.recordFailure(state.failure?.wireCode ?: "G2-CAP-02")
                 startForegroundWithNotification(isCapturing = false)
-                Log.w(TAG, "Controller fail-closed before AudioRecord: $state")
-                // Stop after short delay to allow notification visibility, then terminate
+                Log.w(TAG, "Controller fail-closed before MediaProjection: $state")
                 stopGate2Capture(state.reason)
             } else {
                 telemetry.markCaptureRequested()
@@ -149,7 +186,8 @@ class Gate2PrototypeCaptureService : Service() {
             return
         }
 
-        if (mediaProjection == null) {
+        val proj = mediaProjection
+        if (proj == null) {
             Log.e(TAG, "MediaProjection null -> fail-closed [G2-CAP-02]")
             captureController.onCaptureUnavailable(Gate2Failure.CAPTURE_SOURCE_UNAVAILABLE)
             telemetry.recordFailure("G2-CAP-02")
@@ -157,139 +195,218 @@ class Gate2PrototypeCaptureService : Service() {
             return
         }
 
-        // Build fail-closed capture config - ONLY matching UID, no fallback
-        val captureConfig = try {
-            AudioPlaybackCaptureConfiguration.Builder(mediaProjection!!)
-                .addMatchingUid(targetUid)
-                .build()
-        } catch (e: Exception) {
-            Log.e(TAG, "Capture config failed fail-closed [G2-CAP-03]: ${e.message}")
-            captureController.onCaptureUnavailable(Gate2Failure.CAPTURE_SCOPE_UNVERIFIED)
-            telemetry.recordFailure("G2-CAP-03")
-            stopGate2Capture(ShareStoppedReason.CAPTURE_UNAVAILABLE)
-            return
-        }
-
-        val sampleRate = 48_000
-        val channelConfig = AudioFormat.CHANNEL_IN_STEREO
-        val encoding = AudioFormat.ENCODING_PCM_16BIT
-        val minBuf = AudioRecord.getMinBufferSize(sampleRate, channelConfig, encoding)
-        if (minBuf == AudioRecord.ERROR || minBuf == AudioRecord.ERROR_BAD_VALUE) {
-            Log.e(TAG, "getMinBufferSize error $minBuf")
-            captureController.onCaptureUnavailable(Gate2Failure.CAPTURE_SOURCE_UNAVAILABLE)
-            telemetry.recordFailure("G2-CAP-02")
-            stopGate2Capture(ShareStoppedReason.CAPTURE_UNAVAILABLE)
-            return
-        }
-        // 100ms buffer for stability, rechunker will produce 10ms frames
-        val bufferBytes = (sampleRate * 2 /*stereo*/ * 2 /*16bit*/ / 10).coerceAtLeast(minBuf)
-
-        try {
-            val fmt = AudioFormat.Builder()
-                .setEncoding(encoding)
-                .setSampleRate(sampleRate)
-                .setChannelMask(channelConfig)
-                .build()
-
-            audioRecord = AudioRecord.Builder()
-                .setAudioFormat(fmt)
-                .setAudioPlaybackCaptureConfig(captureConfig)
-                .setBufferSizeInBytes(bufferBytes)
-                .build()
-
-            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-                Log.e(TAG, "AudioRecord not initialized state=${audioRecord?.state}")
-                captureController.onCaptureUnavailable(Gate2Failure.CAPTURE_SOURCE_UNAVAILABLE)
-                telemetry.recordFailure("G2-CAP-02")
-                stopGate2Capture(ShareStoppedReason.CAPTURE_UNAVAILABLE)
-                return
+        // Fix 4: Register MediaProjection.Callback IMMEDIATELY upon getMediaProjection()
+        val callback = object : MediaProjection.Callback() {
+            override fun onStop() {
+                Log.w(TAG, "MediaProjection revoked -> permission_revoked")
+                captureController.onPermissionRevoked()
+                telemetry.recordFailure("G2-CAP-01")
+                stopGate2Capture(ShareStoppedReason.PERMISSION_REQUIRED)
             }
+        }
+        mediaProjectionCallback = callback
+        proj.registerCallback(callback, Handler(Looper.getMainLooper()))
 
-            audioRecord?.startRecording()
-            // Check recording state
-            if (audioRecord?.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
-                Log.e(TAG, "AudioRecord not recording state=${audioRecord?.recordingState}")
-                captureController.onCaptureUnavailable(Gate2Failure.CAPTURE_SOURCE_UNAVAILABLE)
-                telemetry.recordFailure("G2-CAP-02")
+        // Fix 1: Wire MediasoupSpeakerTransport and use onSamplesReady callback
+        val transport = MediasoupSpeakerTransport(applicationContext)
+        transport.onSwapOutcome = { swapped, reason ->
+            if (!swapped) {
+                Log.e(TAG, "Fail-closed: PCM injection swap failed ($reason)")
+                telemetry.recordFailure("G2-CAP-03")
+                captureController.onCaptureUnavailable(Gate2Failure.CAPTURE_SCOPE_UNVERIFIED)
                 stopGate2Capture(ShareStoppedReason.CAPTURE_UNAVAILABLE)
-                return
             }
+        }
+        transport.onTransportClosed = {
+            stopGate2Capture(ShareStoppedReason.HOST_ENDED)
+        }
+        speakerTransport = transport
 
-            isCapturing.set(true)
-            captureController.onCaptureStarted(SystemClock.elapsedRealtimeNanos())
-            Log.i(TAG, "AudioRecord started for uid=$targetUid label=$targetAppLabel sr=$sampleRate buf=$bufferBytes")
+        Thread({
+            try {
+                val createdRoomId = transport.start(
+                    serverUrl = serverUrl,
+                    mediaProjection = proj,
+                    targetUid = targetUid,
+                    appLabel = targetAppLabel,
+                    onSamplesReady = { data, sampleRate, channelCount ->
+                        captureController.onPcmCaptured(
+                            data = data,
+                            sampleRateHz = sampleRate,
+                            channelCount = channelCount,
+                            capturedAtNanos = SystemClock.elapsedRealtimeNanos()
+                        )
+                        // Drain queue so it doesn't overflow when monitoring via SamplesReadyCallback
+                        captureController.drainQueue()
+                    }
+                )
+                roomIdForNotification = createdRoomId
+                _currentRoomId.value = createdRoomId
+                isCapturingAtomic.set(true)
+                sessionStartTimeMs = SystemClock.elapsedRealtime()
+                captureController.onCaptureStarted(SystemClock.elapsedRealtimeNanos())
+                updateNotification()
+                registerMediaSessionListener()
+                registerVolumeReceiver()
+                Log.i(TAG, "Speaker send path live in room: $createdRoomId")
+            } catch (t: Throwable) {
+                Log.e(TAG, "Failed to start WebRTC speaker session", t)
+                captureController.onCaptureUnavailable(Gate2Failure.MEDIA_TRANSPORT_UNAVAILABLE)
+                telemetry.recordFailure("G2-NET-01")
+                stopGate2Capture(ShareStoppedReason.CAPTURE_UNAVAILABLE)
+            }
+        }, "Gate2SpeakerInitThread").start()
+    }
 
-            // Start PCM read thread with validation/rechunking
-            captureThread = Thread({
-                // Buffer as Short for 16-bit PCM
-                val byteBuffer = ByteArray(bufferBytes)
-                val pcmFormat = PcmFormat(sampleRateHz = sampleRate, channelCount = 2)
-                while (isCapturing.get()) {
-                    val read = audioRecord?.read(byteBuffer, 0, byteBuffer.size) ?: -1
-                    if (read > 0) {
-                        // Convert byte[] little-endian PCM16 -> ShortArray
-                        val shorts = ShortArray(read / 2)
-                        for (i in shorts.indices) {
-                            val lo = byteBuffer[i * 2].toInt() and 0xFF
-                            val hi = byteBuffer[i * 2 + 1].toInt()
-                            shorts[i] = ((hi shl 8) or lo).toShort()
+    private fun registerVolumeReceiver() {
+        if (volumeReceiver != null) return
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                if (intent?.action == "android.media.VOLUME_CHANGED_ACTION") {
+                    val streamType = intent.getIntExtra("android.media.EXTRA_VOLUME_STREAM_TYPE", -1)
+                    if (streamType == AudioManager.STREAM_MUSIC) {
+                        val newVol = intent.getIntExtra("android.media.EXTRA_VOLUME_STREAM_VALUE", -1)
+                        Log.d(TAG, "Volume changed: STREAM_MUSIC index=$newVol")
+                        // If volume was adjusted while in Paused state, verify active playback
+                        // immediately so playback isn't trapped in PAUSED.
+                        if (captureController.state.value is Gate2CaptureController.CaptureState.Paused) {
+                            val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && am != null) {
+                                captureController.onPlaybackConfigsChanged(am.activePlaybackConfigurations)
+                            }
+                            attachedController?.playbackState?.state?.let { s ->
+                                if (s == PlaybackState.STATE_PLAYING || s == PlaybackState.STATE_BUFFERING) {
+                                    captureController.applyPlaybackActive(true, fromMediaSession = true)
+                                }
+                            }
                         }
-                        if (shorts.isNotEmpty()) {
-                            captureController.onPcmCaptured(shorts, pcmFormat, SystemClock.elapsedRealtimeNanos())
-                        }
-                    } else if (read == AudioRecord.ERROR_INVALID_OPERATION || read == AudioRecord.ERROR_BAD_VALUE || read == AudioRecord.ERROR_DEAD_OBJECT) {
-                        Log.w(TAG, "AudioRecord read error $read [G2-CAP-02]")
-                        captureController.onCaptureUnavailable(Gate2Failure.CAPTURE_SOURCE_UNAVAILABLE)
-                        telemetry.recordFailure("G2-CAP-02")
-                        isCapturing.set(false)
-                    } else if (read == 0) {
-                        // No data - not silence detection, just no callback; continue
                     }
                 }
-            }, "Gate2PrototypeCaptureThread").apply { isDaemon = true; start() }
+            }
+        }
+        volumeReceiver = receiver
+        val filter = IntentFilter("android.media.VOLUME_CHANGED_ACTION")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
+        } else {
+            registerReceiver(receiver, filter)
+        }
+        Log.i(TAG, "Registered VOLUME_CHANGED_ACTION receiver")
+    }
 
-            // MediaProjection callback for permission revocation -> STOPPED
-            mediaProjection?.registerCallback(object : MediaProjection.Callback() {
-                override fun onStop() {
-                    Log.w(TAG, "MediaProjection stopped -> permission_revoked")
-                    captureController.onPermissionRevoked()
-                    telemetry.recordFailure("G2-CAP-01")
-                    stopGate2Capture(ShareStoppedReason.PERMISSION_REQUIRED)
-                }
-            }, null)
+    private fun unregisterVolumeReceiver() {
+        volumeReceiver?.let {
+            try { unregisterReceiver(it) } catch (_: Exception) {}
+            volumeReceiver = null
+            Log.i(TAG, "Unregistered VOLUME_CHANGED_ACTION receiver")
+        }
+    }
 
-        } catch (e: SecurityException) {
-            Log.e(TAG, "SecurityException startRecording [G2-CAP-01]: ${e.message}")
-            captureController.onPermissionRevoked()
-            telemetry.recordFailure("G2-CAP-01")
-            stopGate2Capture(ShareStoppedReason.PERMISSION_REQUIRED)
-        } catch (e: IllegalArgumentException) {
-            Log.e(TAG, "IllegalArgument capture [G2-CAP-02/03]: ${e.message}")
-            captureController.onCaptureUnavailable(Gate2Failure.CAPTURE_SOURCE_UNAVAILABLE)
-            telemetry.recordFailure("G2-CAP-02")
-            stopGate2Capture(ShareStoppedReason.CAPTURE_UNAVAILABLE)
-        } catch (e: UnsupportedOperationException) {
-            Log.e(TAG, "Unsupported capture [G2-CAP-03]: ${e.message}")
-            captureController.onCaptureUnavailable(Gate2Failure.CAPTURE_SCOPE_UNVERIFIED)
-            telemetry.recordFailure("G2-CAP-03")
-            stopGate2Capture(ShareStoppedReason.CAPTURE_UNAVAILABLE)
+    private fun registerMediaSessionListener() {
+        val msm = getSystemService(Context.MEDIA_SESSION_SERVICE) as? MediaSessionManager ?: return
+        val listenerComponent = ComponentName(this, Gate2NotificationListenerService::class.java)
+        val sessionsListener = MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
+            attachToTargetSession(controllers)
+        }
+        activeSessionsListener = sessionsListener
+        try {
+            msm.addOnActiveSessionsChangedListener(sessionsListener, listenerComponent, Handler(Looper.getMainLooper()))
+            attachToTargetSession(msm.getActiveSessions(listenerComponent))
         } catch (e: Exception) {
-            Log.e(TAG, "Unexpected capture failure [G2-INT-01]: ${e.message}", e)
-            captureController.onCaptureUnavailable(Gate2Failure.INTERNAL_ERROR)
-            telemetry.recordFailure("G2-INT-01")
-            stopGate2Capture(ShareStoppedReason.CAPTURE_UNAVAILABLE)
+            Log.w(TAG, "Unable to register MediaSessionManager listener: ${e.message}")
+        }
+    }
+
+    private fun attachToTargetSession(controllers: List<MediaController>?) {
+        val target = controllers?.firstOrNull { controller ->
+            try {
+                packageManager.getPackageInfo(controller.packageName, 0).applicationInfo.uid == targetUid
+            } catch (_: Exception) { false }
+        }
+        if (target == null) {
+            // Absence from active sessions does NOT mean the app paused (e.g. game, non-session app,
+            // or temporary session recreation during volume/routing changes).
+            return
+        }
+        if (target.packageName == attachedController?.packageName) {
+            val s = target.playbackState?.state
+            if (s == PlaybackState.STATE_PLAYING || s == PlaybackState.STATE_BUFFERING) {
+                captureController.applyPlaybackActive(true, fromMediaSession = true)
+            }
+            return
+        }
+
+        sessionCallback?.let { cb ->
+            try { attachedController?.unregisterCallback(cb) } catch (_: Exception) {}
+        }
+        val cb = object : MediaController.Callback() {
+            override fun onPlaybackStateChanged(state: PlaybackState?) {
+                val playbackState = state?.state ?: return
+                when (playbackState) {
+                    PlaybackState.STATE_PLAYING,
+                    PlaybackState.STATE_BUFFERING,
+                    PlaybackState.STATE_FAST_FORWARDING,
+                    PlaybackState.STATE_REWINDING -> {
+                        captureController.applyPlaybackActive(true, fromMediaSession = true)
+                    }
+                    PlaybackState.STATE_PAUSED,
+                    PlaybackState.STATE_STOPPED -> {
+                        captureController.applyPlaybackActive(false, fromMediaSession = true)
+                    }
+                    else -> {
+                        // Other states: do not change active state
+                    }
+                }
+            }
+            override fun onSessionDestroyed() {
+                attachedController = null
+                sessionCallback = null
+            }
+        }
+        sessionCallback = cb
+        attachedController = target
+        target.registerCallback(cb, Handler(Looper.getMainLooper()))
+
+        val s = target.playbackState?.state
+        if (s == PlaybackState.STATE_PLAYING || s == PlaybackState.STATE_BUFFERING) {
+            captureController.applyPlaybackActive(true, fromMediaSession = true)
+        } else if (s == PlaybackState.STATE_PAUSED || s == PlaybackState.STATE_STOPPED) {
+            captureController.applyPlaybackActive(false, fromMediaSession = true)
         }
     }
 
     fun stopGate2Capture(reason: ShareStoppedReason) {
-        isCapturing.set(false)
-        try { audioRecord?.stop() } catch (_: Exception) {}
-        try { audioRecord?.release() } catch (_: Exception) {}
-        audioRecord = null
+        isCapturingAtomic.set(false)
+        sessionStartTimeMs = 0L
+
+        unregisterVolumeReceiver()
+
+        sessionCallback?.let {
+            try { attachedController?.unregisterCallback(it) } catch (_: Exception) {}
+            sessionCallback = null
+        }
+        attachedController = null
+        activeSessionsListener?.let {
+            try {
+                val msm = getSystemService(Context.MEDIA_SESSION_SERVICE) as? MediaSessionManager
+                msm?.removeOnActiveSessionsChangedListener(it)
+            } catch (_: Exception) {}
+            activeSessionsListener = null
+        }
+
+        mediaProjectionCallback?.let { cb ->
+            try { mediaProjection?.unregisterCallback(cb) } catch (_: Exception) {}
+        }
+        mediaProjectionCallback = null
+
         try { mediaProjection?.stop() } catch (_: Exception) {}
         mediaProjection = null
-        captureThread?.interrupt()
-        captureThread = null
+
+        speakerTransport?.close()
+        speakerTransport = null
+        roomIdForNotification = "No Room"
+        _currentRoomId.value = null
+
         if (captureController.state.value !is Gate2CaptureController.CaptureState.Stopped) {
             captureController.stopCapture(reason)
         }
@@ -306,6 +423,11 @@ class Gate2PrototypeCaptureService : Service() {
         }
     }
 
+    private fun updateNotification() {
+        val nm = getSystemService(NotificationManager::class.java)
+        nm?.notify(NOTIFICATION_ID, buildNotification(isCapturing))
+    }
+
     private fun buildNotification(isCapturing: Boolean): Notification {
         val stopIntent = PendingIntent.getService(
             this, 0, createStopIntent(this), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
@@ -319,7 +441,7 @@ class Gate2PrototypeCaptureService : Service() {
         }
         val content = if (targetAppLabel != "Unknown") "$stateText • $targetAppLabel • $roomIdForNotification" else stateText
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Symphonia Gate2 Prototype")
+            .setContentTitle("Symphonia Gate2 Speaker")
             .setContentText(content)
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setOngoing(isCapturing)

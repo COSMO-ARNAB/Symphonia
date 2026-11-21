@@ -18,7 +18,9 @@ class PcmRechunker(
     @Synchronized
     fun accept(frame: PcmFrame): Result {
         require(frame.format == format) { "PCM format changed during rechunking" }
-        val discontinuity = expectedInputTimestampNanos?.let { it != frame.capturedAtNanos } == true
+        val discontinuity = expectedInputTimestampNanos?.let { expected ->
+            kotlin.math.abs(expected - frame.capturedAtNanos) > 15_000_000L
+        } == true
         if (discontinuity) clearPending()
 
         val input = frame.samples

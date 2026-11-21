@@ -79,6 +79,8 @@ ui_*.xml
 spike_*.png
 screen*.png
 screencap*.png
+device_screen.png
+start_listener.bat
 
 # Python bytecode & virtualenvs
 __pycache__/

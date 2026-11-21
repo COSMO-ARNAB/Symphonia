@@ -15,12 +15,24 @@ describe("request protocol", () => {
     for (const sample of samples) assert.equal(requestSchema.safeParse(sample).success, true);
   });
 
+  it("accepts valid 6-character uppercase alphanumeric room IDs", () => {
+    assert.equal(requestSchema.safeParse({ id: "1", type: "JOIN_ROOM", data: { roomId: "ROOM01" } }).success, true);
+    assert.equal(requestSchema.safeParse({ id: "2", type: "JOIN_ROOM", data: { roomId: "A1B2C3" } }).success, true);
+    assert.equal(requestSchema.safeParse({ id: "3", type: "JOIN_ROOM", data: { roomId: "000000" } }).success, true);
+    assert.equal(requestSchema.safeParse({ id: "4", type: "JOIN_ROOM", data: { roomId: "ZZZZZZ" } }).success, true);
+  });
+
   it("rejects video production and malformed envelopes", () => {
     assert.equal(requestSchema.safeParse({ id: "1", type: "PRODUCE", data: { transportId: "t", kind: "video", rtpParameters: {} } }).success, false);
     assert.equal(requestSchema.safeParse({ type: "PING" }).success, false);
     assert.equal(requestSchema.safeParse({ id: "1", type: "UNKNOWN" }).success, false);
-    assert.equal(requestSchema.safeParse({ id: "1", type: "JOIN_ROOM", data: { roomId: "a".repeat(42) } }).success, false);
-    assert.equal(requestSchema.safeParse({ id: "1", type: "JOIN_ROOM", data: { roomId: `${"a".repeat(42)}=` } }).success, false);
+    assert.equal(requestSchema.safeParse({ id: "1", type: "JOIN_ROOM", data: { roomId: "" } }).success, false);
+    assert.equal(requestSchema.safeParse({ id: "1", type: "JOIN_ROOM", data: { roomId: "A1B2C" } }).success, false);
+    assert.equal(requestSchema.safeParse({ id: "1", type: "JOIN_ROOM", data: { roomId: "A1B2C3D" } }).success, false);
+    assert.equal(requestSchema.safeParse({ id: "1", type: "JOIN_ROOM", data: { roomId: "a1b2c3" } }).success, false);
+    assert.equal(requestSchema.safeParse({ id: "1", type: "JOIN_ROOM", data: { roomId: "ROOM-1" } }).success, false);
+    assert.equal(requestSchema.safeParse({ id: "1", type: "JOIN_ROOM", data: { roomId: "ROOM_1" } }).success, false);
+    assert.equal(requestSchema.safeParse({ id: "1", type: "JOIN_ROOM", data: { roomId: "a".repeat(43) } }).success, false);
     assert.equal(requestSchema.safeParse({ id: "1", type: "CONNECT_WEBRTC_TRANSPORT", data: { transportId: "t", dtlsParameters: { fingerprints: [], secret: "raw" } } }).success, false);
     assert.equal(requestSchema.safeParse({ id: "1", type: "CONSUME", data: { transportId: "t", producerId: "p", rtpCapabilities: { codecs: [{ mimeType: "video/VP8", clockRate: 90000 }] } } }).success, false);
   });

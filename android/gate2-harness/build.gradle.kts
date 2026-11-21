@@ -43,6 +43,9 @@ android {
     packaging {
         resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" }
     }
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 dependencies {
@@ -52,6 +55,7 @@ dependencies {
     implementation(project(":gate2:diagnostics"))
     implementation(project(":gate2:signaling"))
     implementation(project(":gate2:transport"))
+    implementation(project(":gate2:benchmark"))
 
     // AndroidX & Compose
     implementation("androidx.core:core-ktx:1.12.0")

@@ -31,7 +31,8 @@ class Gate2MediaSessionDiscovery(private val context: Context) {
         // Primary: active media sessions - only ever surfaces apps actually producing audio
         try {
             val msm = context.getSystemService(Context.MEDIA_SESSION_SERVICE) as? MediaSessionManager
-            val sessions = msm?.getActiveSessions(null)
+            val component = android.content.ComponentName(context, Gate2NotificationListenerService::class.java)
+            val sessions = msm?.getActiveSessions(component)
             sessions?.forEach { controller ->
                 val pkg = controller.packageName
                 try {

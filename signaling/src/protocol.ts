@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 const identifier = z.string().min(1).max(128).regex(/^[A-Za-z0-9_.:-]+$/);
-export const roomIdSchema = z.string().length(43).regex(/^[A-Za-z0-9_-]{43}$/);
+export const roomIdSchema = z.string().regex(/^[0-9A-Z]{6}$/);
 const requestBase = z.object({ id: identifier }).strict();
 const fingerprintSchema = z.object({
   algorithm: z.enum(["sha-1", "sha-224", "sha-256", "sha-384", "sha-512"]),

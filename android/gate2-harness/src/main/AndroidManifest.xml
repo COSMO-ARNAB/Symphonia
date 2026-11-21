@@ -1,9 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Gate 2 Prototype Harness: fail-closed app-scoped capture only -->
+    <!-- Gate 2 Prototype Harness: fail-closed app-scoped capture & playout -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.INTERNET" />
@@ -48,12 +49,30 @@
             </intent-filter>
         </activity>
 
-        <!-- Gate 2 Prototype Capture Service - explicitly prototype-named, fail-closed -->
+        <!-- Gate 2 Prototype Capture Service - Speaker foreground service -->
         <service
             android:name=".Gate2PrototypeCaptureService"
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="mediaProjection" />
+
+        <!-- Gate 2 Prototype Listener Service - Listener foreground service (Fix 3) -->
+        <service
+            android:name=".Gate2PrototypeListenerService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
+
+        <!-- Gate 2 Notification Listener Service stub (Fix 4: legal MediaSession discovery) -->
+        <service
+            android:name=".Gate2NotificationListenerService"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
 
     </application>
 </manifest>

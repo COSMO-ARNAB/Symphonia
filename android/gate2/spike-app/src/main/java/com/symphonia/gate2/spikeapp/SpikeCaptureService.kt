@@ -122,7 +122,7 @@ class SpikeCaptureService : Service() {
         // Room FIRST - the server requires membership before any SFU request.
         val room = signaling!!.request("CREATE_ROOM", JSONObject())
         publishRoomId(room.getString("roomId"))
-        log("room created: ${room.getString("roomId").take(8)}… (full id: ${room.getString("roomId")})")
+        log("room created: ${room.getString("roomId")}")
 
         val rtpCaps = signaling!!.request("GET_ROUTER_RTP_CAPABILITIES", JSONObject())
             .getJSONObject("rtpCapabilities")

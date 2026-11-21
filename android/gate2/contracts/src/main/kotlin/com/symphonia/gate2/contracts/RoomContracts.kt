@@ -5,7 +5,17 @@ const val MVP_SPEAKER_SLOT: Int = 1
 
 @JvmInline
 value class RoomId(val value: String) {
-    init { require(value.isNotBlank()) { "Room ID must not be blank" } }
+    init {
+        require(REGEX.matches(value)) {
+            "Room ID must be exactly 6 uppercase alphanumeric characters: $value"
+        }
+    }
+
+    companion object {
+        val REGEX = Regex("^[A-Z0-9]{6}$")
+
+        fun isValid(value: String): Boolean = REGEX.matches(value)
+    }
 }
 
 @JvmInline
