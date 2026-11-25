@@ -41,6 +41,7 @@
         <activity
             android:name=".Gate2PrototypeHarnessActivity"
             android:exported="true"
+            android:launchMode="singleTop"
             android:label="Gate2 Prototype Harness"
             android:theme="@android:style/Theme.Material.Light.NoActionBar">
             <intent-filter>

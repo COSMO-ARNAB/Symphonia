@@ -48,6 +48,13 @@ import java.util.concurrent.atomic.AtomicBoolean
  */
 class Gate2PrototypeCaptureService : Service() {
 
+    sealed interface InviteState {
+        data object Idle : InviteState
+        data object Preparing : InviteState
+        data class Ready(val url: String, val expiresAt: Long = 0L) : InviteState
+        data class Failed(val message: String) : InviteState
+    }
+
     companion object {
         private const val TAG = "Gate2PrototypeSvc"
         private const val CHANNEL_ID = "gate2_prototype_capture"
@@ -59,7 +66,11 @@ class Gate2PrototypeCaptureService : Service() {
         const val EXTRA_ROOM_ID = "extra_room_id"
         const val EXTRA_SERVER_URL = "extra_server_url"
         const val EXTRA_RELAY_ADDRESS = "extra_relay_address"
+        const val EXTRA_USE_PHONE_RELAY = "extra_use_phone_relay"
         const val ACTION_STOP_CAPTURE = "com.symphonia.gate2.prototype.harness.ACTION_STOP_CAPTURE"
+
+        @Volatile var isServiceRunning: Boolean = false
+            private set
 
         private fun createStopIntent(context: Context): Intent =
             Intent(context, Gate2PrototypeCaptureService::class.java).apply { action = ACTION_STOP_CAPTURE }
@@ -103,9 +114,15 @@ class Gate2PrototypeCaptureService : Service() {
     val currentRoomId: StateFlow<String?> = _currentRoomId.asStateFlow()
     private val _listenerInvite = MutableStateFlow<String?>(null)
     val listenerInvite = _listenerInvite.asStateFlow()
-    val usesPhoneRelay: Boolean get() = Gate2PhoneRelay.isAvailable(this)
+    private val _inviteState = MutableStateFlow<InviteState>(InviteState.Idle)
+    val inviteState: StateFlow<InviteState> = _inviteState.asStateFlow()
+    private val _listenerCount = MutableStateFlow(0)
+    val listenerCount: StateFlow<Int> = _listenerCount.asStateFlow()
+    private val inviteRequestInFlight = AtomicBoolean(false)
+    @Volatile var usesPhoneRelay: Boolean = false
+        private set
 
-    var serverUrl: String = "ws://10.0.2.2:3000/gate2"
+    var serverUrl: String = Gate2HarnessConfig.DEFAULT_SIGNALING_URL
         private set
 
     override fun onCreate() {
@@ -155,7 +172,9 @@ class Gate2PrototypeCaptureService : Service() {
         targetUid = intent?.getIntExtra(EXTRA_TARGET_UID, -1) ?: -1
         targetAppLabel = intent?.getStringExtra(EXTRA_TARGET_APP_LABEL) ?: "Unknown"
         roomIdForNotification = intent?.getStringExtra(EXTRA_ROOM_ID) ?: "Gate2-Room"
-        serverUrl = intent?.getStringExtra(EXTRA_SERVER_URL) ?: "ws://10.0.2.2:3000/gate2"
+        serverUrl = intent?.getStringExtra(EXTRA_SERVER_URL) ?: Gate2HarnessConfig.DEFAULT_SIGNALING_URL
+        usesPhoneRelay = intent?.getBooleanExtra(EXTRA_USE_PHONE_RELAY, Gate2PhoneRelay.isAvailable(this))
+            ?: Gate2PhoneRelay.isAvailable(this)
 
         if (resultData != null && targetUid != -1) {
             val state = captureController.requestCapture(targetAppLabel, targetUid)
@@ -165,6 +184,7 @@ class Gate2PrototypeCaptureService : Service() {
                 Log.w(TAG, "Controller fail-closed before MediaProjection: $state")
                 stopGate2Capture(state.reason)
             } else {
+                isServiceRunning = true
                 telemetry.markCaptureRequested()
                 startForegroundWithNotification(isCapturing = true)
                 initAudioCapture(resultData, targetUid, intent?.getStringExtra(EXTRA_RELAY_ADDRESS))
@@ -227,6 +247,10 @@ class Gate2PrototypeCaptureService : Service() {
         transport.onTransportClosed = {
             stopGate2Capture(ShareStoppedReason.HOST_ENDED)
         }
+        transport.onListenerCountChanged = { count ->
+            _listenerCount.value = count
+            if (isCapturingAtomic.get()) updateNotification()
+        }
         speakerTransport = transport
         val relay = if (usesPhoneRelay) Gate2PhoneRelay(applicationContext, relayAddress) {
             if (speakerTransport === transport) stopGate2Capture(ShareStoppedReason.HOST_ENDED)
@@ -247,13 +271,11 @@ class Gate2PrototypeCaptureService : Service() {
                         captureController.onSampleChunkOffered()
                     }
                 )
-                val invite = relay?.invite(createdRoomId)
                 if (speakerTransport !== transport) {
                     transport.close()
                     return@Thread
                 }
                 roomIdForNotification = createdRoomId
-                _listenerInvite.value = invite
                 _currentRoomId.value = createdRoomId
                 isCapturingAtomic.set(true)
                 sessionStartTimeMs = SystemClock.elapsedRealtime()
@@ -262,6 +284,7 @@ class Gate2PrototypeCaptureService : Service() {
                 registerMediaSessionListener()
                 registerVolumeReceiver()
                 Log.i(TAG, "Speaker send path live in room: $createdRoomId")
+                fetchListenerInvite(transport, relay, createdRoomId)
             } catch (t: Throwable) {
                 if (speakerTransport !== transport) return@Thread
                 Log.e(TAG, "Failed to start WebRTC speaker session", t)
@@ -270,6 +293,43 @@ class Gate2PrototypeCaptureService : Service() {
                 stopGate2Capture(ShareStoppedReason.CAPTURE_UNAVAILABLE)
             }
         }, "Gate2SpeakerInitThread").start()
+    }
+
+    fun retryListenerInvite() {
+        val transport = speakerTransport ?: return
+        val roomId = _currentRoomId.value ?: transport.roomId ?: return
+        val relay = phoneRelay
+        Thread({
+            fetchListenerInvite(transport, relay, roomId)
+        }, "Gate2InviteRetryThread").start()
+    }
+
+    private fun fetchListenerInvite(
+        transport: MediasoupSpeakerTransport,
+        relay: Gate2PhoneRelay?,
+        roomId: String,
+    ) {
+        if (!inviteRequestInFlight.compareAndSet(false, true)) return
+        try {
+            if (speakerTransport !== transport || !isCapturingAtomic.get()) return
+            _inviteState.value = InviteState.Preparing
+            val (url, expiresAt) = if (relay != null) {
+                relay.invite(roomId) to 0L
+            } else {
+                val invite = transport.getListenerInvite()
+                invite.url to invite.expiresAt
+            }
+            if (speakerTransport !== transport || !isCapturingAtomic.get()) return
+            _listenerInvite.value = url
+            _inviteState.value = InviteState.Ready(url, expiresAt)
+        } catch (t: Throwable) {
+            if (speakerTransport !== transport || !isCapturingAtomic.get()) return
+            Log.w(TAG, "Failed to obtain listener invite: ${t.message}")
+            _listenerInvite.value = null
+            _inviteState.value = InviteState.Failed(t.message ?: "Unable to fetch invite")
+        } finally {
+            inviteRequestInFlight.set(false)
+        }
     }
 
     private fun registerVolumeReceiver() {
@@ -422,7 +482,10 @@ class Gate2PrototypeCaptureService : Service() {
         val relay = phoneRelay
         phoneRelay = null
         relay?.close()
+        isServiceRunning = false
+        _listenerCount.value = 0
         _listenerInvite.value = null
+        _inviteState.value = InviteState.Idle
         roomIdForNotification = "No Room"
         _currentRoomId.value = null
 
@@ -458,7 +521,9 @@ class Gate2PrototypeCaptureService : Service() {
             is Gate2CaptureController.CaptureState.Paused -> "Paused — ${s.appLabel} switched away"
             is Gate2CaptureController.CaptureState.Stopped -> "Stopped — ${s.reason}"
         }
-        val content = if (targetAppLabel != "Unknown") "$stateText • $targetAppLabel • $roomIdForNotification" else stateText
+        val listeners = _listenerCount.value
+        val listenerSuffix = if (isCapturing) " • $listeners listening" else ""
+        val content = if (targetAppLabel != "Unknown") "$stateText • $targetAppLabel • $roomIdForNotification$listenerSuffix" else stateText
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Symphonia Gate2 Speaker")
             .setContentText(content)

@@ -66,6 +66,7 @@ const rtpParametersSchema = z.object({
 }).strict();
 
 export const requestSchema = z.discriminatedUnion("type", [
+  requestBase.extend({ type: z.literal("GET_LISTENER_INVITE"), data: z.object({}).strict().optional() }).strict(),
   requestBase.extend({ type: z.literal("CREATE_ROOM"), data: z.object({ displayName: z.string().min(1).max(80).optional() }).strict().optional() }).strict(),
   requestBase.extend({ type: z.literal("JOIN_ROOM"), data: z.object({ roomId: roomIdSchema, displayName: z.string().min(1).max(80).optional() }).strict() }).strict(),
   requestBase.extend({ type: z.literal("LEAVE_ROOM"), data: z.object({}).strict().optional() }).strict(),

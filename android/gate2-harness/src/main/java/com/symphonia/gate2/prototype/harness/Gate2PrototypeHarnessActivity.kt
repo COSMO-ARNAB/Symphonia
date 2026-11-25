@@ -29,9 +29,12 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Switch
 import android.graphics.Bitmap
 import android.graphics.Color as AndroidColor
 import androidx.compose.foundation.Image
@@ -42,7 +45,10 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import com.google.zxing.BarcodeFormat
@@ -55,6 +61,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -94,7 +101,9 @@ class Gate2PrototypeHarnessActivity : ComponentActivity() {
     private var selectedApp by mutableStateOf<Gate2MediaSessionDiscovery.DiscoveredApp?>(null)
     private var harnessRole by mutableStateOf(HarnessRole.SPEAKER)
 
-    private var serverUrlInput by mutableStateOf("ws://192.168.0.109:8080/gate2")
+    private val harnessConfig by lazy { Gate2HarnessConfig(applicationContext) }
+    private var serverUrlInput by mutableStateOf(Gate2HarnessConfig.DEFAULT_SIGNALING_URL)
+    private var demoMode by mutableStateOf(false)
     private var roomIdInput by mutableStateOf("")
     private var relayAddress: String? = null
 
@@ -133,12 +142,14 @@ class Gate2PrototypeHarnessActivity : ComponentActivity() {
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK && result.data != null && selectedApp != null) {
+            val usePhoneRelay = !demoMode && Gate2PhoneRelay.isAvailable(this)
             val svcIntent = Intent(this, Gate2PrototypeCaptureService::class.java).apply {
                 putExtra(Gate2PrototypeCaptureService.EXTRA_RESULT_DATA, result.data)
                 putExtra(Gate2PrototypeCaptureService.EXTRA_TARGET_UID, selectedApp!!.uid)
                 putExtra(Gate2PrototypeCaptureService.EXTRA_TARGET_APP_LABEL, selectedApp!!.appLabel)
-                putExtra(Gate2PrototypeCaptureService.EXTRA_SERVER_URL, serverUrlInput)
+                putExtra(Gate2PrototypeCaptureService.EXTRA_SERVER_URL, serverUrlInput.trim())
                 putExtra(Gate2PrototypeCaptureService.EXTRA_RELAY_ADDRESS, relayAddress)
+                putExtra(Gate2PrototypeCaptureService.EXTRA_USE_PHONE_RELAY, usePhoneRelay)
             }
             if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(
                     this, Manifest.permission.POST_NOTIFICATIONS
@@ -167,7 +178,7 @@ class Gate2PrototypeHarnessActivity : ComponentActivity() {
             projectionLauncher.launch(projection.createScreenCaptureIntent())
         }
 
-        if (!Gate2PhoneRelay.isAvailable(this)) {
+        if (demoMode || !Gate2PhoneRelay.isAvailable(this)) {
             requestProjection(null)
             return
         }
@@ -185,8 +196,27 @@ class Gate2PrototypeHarnessActivity : ComponentActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        if (Gate2PrototypeCaptureService.isServiceRunning && !isSpeakerBound) {
+            bindService(Intent(this, Gate2PrototypeCaptureService::class.java), speakerConnection, 0)
+            isSpeakerActive = true
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        val snapshot = harnessConfig.applyIntentExtras(intent)
+        serverUrlInput = snapshot.signalingUrl
+        demoMode = snapshot.demoMode
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val initialConfig = harnessConfig.applyIntentExtras(intent)
+        serverUrlInput = initialConfig.signalingUrl
+        demoMode = initialConfig.demoMode
         val discovery = Gate2MediaSessionDiscovery(this)
 
         setContent {
@@ -286,11 +316,35 @@ class Gate2PrototypeHarnessActivity : ComponentActivity() {
                             }
                         }
 
-                        val localSpeaker = harnessRole == HarnessRole.SPEAKER &&
-                            remember { Gate2PhoneRelay.isAvailable(this@Gate2PrototypeHarnessActivity) }
+                        val relayAvailable = remember { Gate2PhoneRelay.isAvailable(this@Gate2PrototypeHarnessActivity) }
+                        val localSpeaker = harnessRole == HarnessRole.SPEAKER && relayAvailable && !demoMode
                         // Connection Settings
                         Card(modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
                             Column(modifier = Modifier.padding(12.dp)) {
+                                if (relayAvailable && harnessRole == HarnessRole.SPEAKER) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                                            Text("Demo mode (AWS via WireGuard)", style = MaterialTheme.typography.titleSmall)
+                                            Text(
+                                                if (demoMode) "Using private signaling URL for signed HTTPS invites"
+                                                else "Using offline on-phone sharing over Wi-Fi or hotspot",
+                                                style = MaterialTheme.typography.bodySmall
+                                            )
+                                        }
+                                        Switch(
+                                            checked = demoMode,
+                                            enabled = !isSpeakerActive,
+                                            onCheckedChange = { enabled ->
+                                                demoMode = enabled
+                                                harnessConfig.saveDemoMode(enabled)
+                                            }
+                                        )
+                                    }
+                                }
                                 if (localSpeaker) {
                                     Text("On-phone sharing", style = MaterialTheme.typography.titleSmall)
                                     Text("Connect the Listener to the same Wi-Fi or hotspot, then share the room QR.")
@@ -298,8 +352,11 @@ class Gate2PrototypeHarnessActivity : ComponentActivity() {
                                     Text("Signaling Configuration", style = MaterialTheme.typography.titleSmall)
                                     OutlinedTextField(
                                         value = serverUrlInput,
-                                        onValueChange = { serverUrlInput = it },
-                                        label = { Text("Signaling Server (ws://host:8080/gate2)") },
+                                        onValueChange = { updated ->
+                                            serverUrlInput = updated
+                                            harnessConfig.saveSignalingUrl(updated)
+                                        },
+                                        label = { Text("Private Signaling URL (ws://host:8080/gate2)") },
                                         modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
                                         singleLine = true
                                     )
@@ -326,7 +383,6 @@ class Gate2PrototypeHarnessActivity : ComponentActivity() {
                                     selectedApp = selectedApp,
                                     isCapturing = isSpeakerActive,
                                     captureService = captureService,
-                                    serverUrl = serverUrlInput,
                                     stats = speakerStats,
                                     pollTick = pollTick,
                                     onRefresh = { discovered = discovery.discover() },
@@ -448,7 +504,6 @@ private fun SpeakerView(
     selectedApp: Gate2MediaSessionDiscovery.DiscoveredApp?,
     isCapturing: Boolean,
     captureService: Gate2PrototypeCaptureService?,
-    serverUrl: String,
     stats: SpeakerTransportStats?,
     pollTick: Int,
     onRefresh: () -> Unit,
@@ -515,7 +570,10 @@ private fun SpeakerView(
         // Collect reactive state flows from the service and controller
         val activeRoomId by captureService.currentRoomId.collectAsState()
         val captureState by captureService.captureController.state.collectAsState()
-        val signedInvite by captureService.listenerInvite.collectAsState()
+        val inviteState by captureService.inviteState.collectAsState()
+        val listenerCount by captureService.listenerCount.collectAsState()
+        val clipboardManager = LocalClipboardManager.current
+        var copiedUrl by remember { mutableStateOf<String?>(null) }
 
         @Suppress("UNUSED_VARIABLE")
         val tick = pollTick
@@ -534,84 +592,130 @@ private fun SpeakerView(
             is Gate2CaptureController.CaptureState.Stopped -> "Stopped (${s.reason})"
         }
 
-        // Generate QR code for instant join over Wi-Fi
-        val isPinValid = displayRoomId.length == 6 && displayRoomId.all { it in 'A'..'Z' || it in '0'..'9' }
-        val listenerWebUrl = remember(serverUrl, displayRoomId, signedInvite) {
-            if (captureService.usesPhoneRelay) signedInvite
-            else if (isPinValid) {
-                val cleanBase = serverUrl
-                    .replaceFirst(Regex("^wss?://", RegexOption.IGNORE_CASE), "http://")
-                    .replaceFirst(Regex("/gate2/?$"), "")
-                "$cleanBase/listener.html?roomId=$displayRoomId"
-            } else null
-        }
-
-        val qrBitmap = remember(listenerWebUrl) {
-            listenerWebUrl?.let { url ->
-                try {
-                    val size = 512
-                    val bitMatrix = QRCodeWriter().encode(url, BarcodeFormat.QR_CODE, size, size)
-                    val pixels = IntArray(size * size)
-                    for (y in 0 until size) {
-                        val offset = y * size
-                        for (x in 0 until size) {
-                            pixels[offset + x] = if (bitMatrix[x, y]) AndroidColor.BLACK else AndroidColor.WHITE
+        val readyInviteUrl = if (isCapturing) (inviteState as? Gate2PrototypeCaptureService.InviteState.Ready)?.url else null
+        val qrBitmap by produceState<Bitmap?>(initialValue = null, readyInviteUrl) {
+            value = readyInviteUrl?.let { url ->
+                withContext(Dispatchers.Default) {
+                    runCatching {
+                        val size = 256
+                        val bitMatrix = QRCodeWriter().encode(url, BarcodeFormat.QR_CODE, size, size)
+                        val pixels = IntArray(size * size)
+                        for (y in 0 until size) {
+                            val offset = y * size
+                            for (x in 0 until size) {
+                                pixels[offset + x] = if (bitMatrix[x, y]) AndroidColor.BLACK else AndroidColor.WHITE
+                            }
                         }
-                    }
-                    val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.RGB_565)
-                    bmp.setPixels(pixels, 0, size, 0, 0, size, size)
-                    bmp
-                } catch (_: Exception) {
-                    null
+                        Bitmap.createBitmap(size, size, Bitmap.Config.RGB_565).apply {
+                            setPixels(pixels, 0, size, 0, 0, size, size)
+                        }
+                    }.getOrNull()
                 }
             }
         }
 
-        // 1. QR Code Card (Auto-Join on scan)
-        if (qrBitmap != null) {
-            Card(
-                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
-            ) {
-                Column(
-                    modifier = Modifier.padding(16.dp).fillMaxWidth(),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    Text(
-                        "Scan to Listen (Auto-Join)",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onSecondaryContainer
-                    )
-                    Text(
-                        "Point another phone's camera here to listen live",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSecondaryContainer
-                    )
-                    Spacer(modifier = Modifier.height(12.dp))
-                    Image(
-                        bitmap = qrBitmap.asImageBitmap(),
-                        contentDescription = "Room QR Code",
-                        modifier = Modifier
-                            .size(220.dp)
-                            .clip(RoundedCornerShape(12.dp))
-                    )
-                    Spacer(modifier = Modifier.height(10.dp))
-                    Text(
-                        "PIN: $displayRoomId",
-                        style = MaterialTheme.typography.headlineMedium,
-                        fontWeight = FontWeight.ExtraBold,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                    SelectionContainer {
-                        Text(
-                            listenerWebUrl ?: "",
-                            style = MaterialTheme.typography.labelSmall,
-                            textAlign = TextAlign.Center,
-                            modifier = Modifier.padding(top = 4.dp)
-                        )
+        if (isCapturing) {
+            when (val invite = inviteState) {
+                is Gate2PrototypeCaptureService.InviteState.Preparing -> {
+                    Card(
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(16.dp).fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                            Text("Preparing invite…", style = MaterialTheme.typography.bodyMedium)
+                        }
                     }
                 }
+                is Gate2PrototypeCaptureService.InviteState.Failed -> {
+                    Card(
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp).fillMaxWidth()) {
+                            Text(
+                                "Invite unavailable: ${invite.message}",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onErrorContainer
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Button(onClick = { captureService.retryListenerInvite() }) {
+                                Text("Retry")
+                            }
+                        }
+                    }
+                }
+                is Gate2PrototypeCaptureService.InviteState.Ready -> {
+                    Card(
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(16.dp).fillMaxWidth(),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Text(
+                                "Scan to Listen",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer
+                            )
+                            Text(
+                                "Scan the QR or share the link, then tap Play",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer
+                            )
+                            Spacer(modifier = Modifier.height(12.dp))
+                            if (qrBitmap != null) {
+                                Image(
+                                    bitmap = qrBitmap!!.asImageBitmap(),
+                                    contentDescription = "Room QR Code",
+                                    filterQuality = FilterQuality.None,
+                                    modifier = Modifier
+                                        .size(220.dp)
+                                        .clip(RoundedCornerShape(12.dp))
+                                )
+                            } else {
+                                CircularProgressIndicator(modifier = Modifier.size(28.dp))
+                            }
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Text(
+                                "PIN: $displayRoomId",
+                                style = MaterialTheme.typography.headlineMedium,
+                                fontWeight = FontWeight.ExtraBold,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            Text(
+                                if (listenerCount == 1) "1 person listening" else "$listenerCount people listening",
+                                style = MaterialTheme.typography.titleSmall,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                modifier = Modifier.padding(top = 4.dp)
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            OutlinedButton(
+                                onClick = {
+                                    clipboardManager.setText(AnnotatedString(invite.url))
+                                    copiedUrl = invite.url
+                                }
+                            ) {
+                                Text(if (copiedUrl == invite.url) "Copied Link" else "Copy Link")
+                            }
+                            SelectionContainer {
+                                Text(
+                                    invite.url,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier.padding(top = 6.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+                is Gate2PrototypeCaptureService.InviteState.Idle -> Unit
             }
         }
 
@@ -620,6 +724,7 @@ private fun SpeakerView(
             Column(modifier = Modifier.padding(12.dp)) {
                 Text("Speaker Live Telemetry", style = MaterialTheme.typography.titleSmall)
                 Text("Room ID: $displayRoomId", style = MaterialTheme.typography.bodyMedium)
+                Text("Listeners: $listenerCount", style = MaterialTheme.typography.bodyMedium)
                 Text("State: $stateLabel", style = MaterialTheme.typography.bodyMedium)
                 Text("Offered Frames: ${ctl.totalOfferedFrames} | Dropped: ${ctl.totalDroppedFrames}")
                 if (stats != null) {

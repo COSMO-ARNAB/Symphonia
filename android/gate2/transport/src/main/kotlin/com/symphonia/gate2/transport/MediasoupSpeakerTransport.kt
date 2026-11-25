@@ -63,9 +63,14 @@ class MediasoupSpeakerTransport(private val context: Context) {
 
     private var currentAppLabel: String? = null
     private val closed = AtomicBoolean(false)
+    private val activeListenerIds = LinkedHashSet<String>()
+
+    @Volatile var listenerCount: Int = 0
+        private set
 
     var onTransportClosed: (() -> Unit)? = null
     var onSwapOutcome: ((Boolean, String?) -> Unit)? = null
+    var onListenerCountChanged: ((Int) -> Unit)? = null
 
     fun start(
         serverUrl: String,
@@ -103,6 +108,13 @@ class MediasoupSpeakerTransport(private val context: Context) {
 
         // 3. Signaling connection
         val client = Gate2SignalingClient(serverUrl)
+        synchronized(activeListenerIds) { activeListenerIds.clear() }
+        updateListenerCount(0)
+        client.onNotification = { type, data -> handleSignalingNotification(type, data) }
+        client.onConnectionClosed = { _, _, _ ->
+            synchronized(activeListenerIds) { activeListenerIds.clear() }
+            updateListenerCount(0)
+        }
         client.connectBlocking(8_000)
         signaling = client
 
@@ -218,6 +230,12 @@ class MediasoupSpeakerTransport(private val context: Context) {
         }
     }
 
+    fun getListenerInvite(): Gate2SignalingClient.ListenerInvite {
+        val client = signaling ?: throw IllegalStateException("Signaling client not connected")
+        check(!closed.get() && isProducing) { "Speaker stream is not active" }
+        return client.getListenerInvite()
+    }
+
     /**
      * Polls WebRTC statistics (Fix 6).
      * Extracts outbound-rtp and remote-inbound-rtp (RTCP receiver report from SFU).
@@ -287,8 +305,43 @@ class MediasoupSpeakerTransport(private val context: Context) {
         )
     }
 
+    internal fun handleSignalingNotification(type: String, data: JSONObject) {
+        val changedCount: Int? = synchronized(activeListenerIds) {
+            when (type) {
+                "PARTICIPANT_CONNECTED" -> {
+                    val participantId = data.optString("participantId", "")
+                    val role = data.optString("role", "")
+                    if (role == "LISTENER" && participantId.isNotBlank() && activeListenerIds.add(participantId)) {
+                        activeListenerIds.size
+                    } else null
+                }
+                "PARTICIPANT_DISCONNECTED" -> {
+                    val participantId = data.optString("participantId", "")
+                    if (participantId.isNotBlank() && activeListenerIds.remove(participantId)) {
+                        activeListenerIds.size
+                    } else null
+                }
+                "ROOM_CLOSED" -> {
+                    if (activeListenerIds.isNotEmpty()) {
+                        activeListenerIds.clear()
+                        0
+                    } else null
+                }
+                else -> null
+            }
+        }
+        if (changedCount != null) updateListenerCount(changedCount)
+    }
+
+    private fun updateListenerCount(count: Int) {
+        listenerCount = count
+        onListenerCountChanged?.invoke(count)
+    }
+
     fun close() {
         if (closed.compareAndSet(false, true)) {
+            synchronized(activeListenerIds) { activeListenerIds.clear() }
+            updateListenerCount(0)
             runCatching { signaling?.stateUpdate(state = "STOPPED", appLabel = currentAppLabel, reason = "host_ended") }
             runCatching { producer?.close() }
             runCatching { audioTrack?.dispose() }

@@ -3,39 +3,61 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Symphonia Gate2 Spike — Listener</title>
+<title>Symphonia — Listener</title>
 <style>
-  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
-  #status { font-weight: bold; margin: 1rem 0; }
-  input { width: 100%; box-sizing: border-box; padding: 0.5rem; font: inherit; margin: 0.25rem 0 1rem; }
-  button { padding: 0.5rem 1.5rem; font: inherit; cursor: pointer; }
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; color: #111; }
+  #status { font-weight: bold; margin: 1rem 0; font-size: 17px; color: #333; }
+  #status.error { color: #c00; }
+  #status.live { color: #155724; }
+  input { width: 100%; box-sizing: border-box; padding: 0.6rem; font: inherit; margin: 0.25rem 0 0.75rem; }
+  button { padding: 0.75rem 1.5rem; font: inherit; font-weight: 600; cursor: pointer; border: none; border-radius: 6px; }
+  #play { width: 100%; font-size: 18px; background: #1e7e34; color: #fff; }
+  #play:disabled { opacity: 0.6; cursor: default; }
+  #paste { margin-top: 0.5rem; background: #e9ecef; color: #111; font-size: 14px; padding: 0.45rem 0.9rem; }
+  .invite-card { background: #e7f5ea; border: 2px solid #28a745; border-radius: 8px; padding: 12px; margin: 12px 0; text-align: center; }
   #log { white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 12px;
-         background: #f3f3f3; padding: 1rem; margin-top: 1.5rem; border-radius: 6px; }
+         background: #f3f3f3; padding: 0.75rem; margin-top: 1.25rem; border-radius: 6px; }
   .hint { color: #555; font-size: 14px; }
 </style>
 </head>
 <body>
-<h2>Symphonia Gate2 Spike — Listener (throwaway)</h2>
-<p class="hint">Chrome on the laptop. Join the room created by the phone (Speaker) and listen.</p>
+<h2>Symphonia — Listener</h2>
+<p class="hint">Tap Play to listen live to the Speaker's shared app audio.</p>
+
+<div id="invite-banner" class="invite-card" style="display:none;">
+  <div id="invite-pin" style="font-size: 16px; color: #155724;"></div>
+</div>
 
 <label for="room">Room PIN (6 uppercase letters/digits)</label>
 <input id="room" placeholder="e.g. A1B2C3" maxlength="6" autocomplete="off" />
-<button id="join" style="font-size: 16px; padding: 10px 20px; font-weight: bold; background: #0066cc; color: #fff; border: none; border-radius: 4px;">JOIN &amp; LISTEN (CLICK HERE)</button>
-<button id="paste" type="button">PASTE ROOM ID</button>
-<div id="status" style="font-size: 18px; color: #d00;">idle</div>
+<button id="play" type="button">▶ Play</button>
+<button id="paste" type="button">Paste Room PIN</button>
+<div id="status">Ready — tap Play to listen</div>
 <div id="log"></div>
 
 <script type="module">
 import mediasoupClient from '/mediasoup-client.esm.js';
 const { Device } = mediasoupClient;
 
-(async () => {
+(() => {
   const logEl = document.getElementById('log');
   const statusEl = document.getElementById('status');
-  const log = (m) => { logEl.textContent += m + '\n'; };
-  const setStatus = (s) => { statusEl.textContent = s; };
-
   const roomInput = document.getElementById('room');
+  const playBtn = document.getElementById('play');
+  const inviteBanner = document.getElementById('invite-banner');
+  const invitePin = document.getElementById('invite-pin');
+  const logLines = [];
+
+  const log = (m) => {
+    logLines.push(m);
+    if (logLines.length > 50) logLines.shift();
+    logEl.textContent = logLines.join('\n');
+  };
+  const setStatus = (text, tone = '') => {
+    statusEl.textContent = text;
+    statusEl.className = tone;
+  };
+
   roomInput.addEventListener('input', () => {
     roomInput.value = roomInput.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
   });
@@ -44,165 +66,47 @@ const { Device } = mediasoupClient;
   const invite = new URLSearchParams(location.hash.slice(1)).get('invite');
   const initialRoom = (params.get('roomId') || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
   if (initialRoom) {
-    document.getElementById('room').value = initialRoom;
-    statusEl.innerHTML = `
-      <div style="background: #e7f5ea; border: 2px solid #28a745; border-radius: 8px; padding: 12px; margin: 10px 0; text-align: center;">
-        <div style="font-size: 16px; color: #155724; margin-bottom: 8px;"><strong>Room PIN: ${initialRoom}</strong> (Auto-detected from QR Code)</div>
-        <button id="qr-join" type="button" style="font-size: 18px; padding: 12px 24px; font-weight: bold; background: #28a745; color: #fff; border: none; border-radius: 6px; cursor: pointer; width: 100%;">
-          ▶ TAP HERE TO START LISTENING
-        </button>
-      </div>`;
-    document.getElementById('qr-join').onclick = () => {
-      document.getElementById('join').click();
-    };
-    // Attempt instant autoplay after short delay; if mobile browser requires a user gesture, the big green button above is ready
-    setTimeout(() => { document.getElementById('join').click(); }, 300);
+    roomInput.value = initialRoom;
+    invitePin.textContent = `Room PIN: ${initialRoom}`;
+    inviteBanner.style.display = 'block';
   }
 
-  document.getElementById('join').onclick = () => main().catch((e) => {
-    setStatus('FAILED: ' + e.message);
-    log('ERROR ' + (e && e.stack ? e.stack : e));
-  });
+  let activeSession = null;
+
+  playBtn.onclick = async () => {
+    if (activeSession) activeSession.close();
+    playBtn.disabled = true;
+    try {
+      activeSession = await startListening();
+    } catch (e) {
+      setStatus('Unable to join: ' + (e && e.message ? e.message : 'connection rejected'), 'error');
+      log('ERROR ' + (e && e.stack ? e.stack : String(e)));
+      playBtn.disabled = false;
+    }
+  };
 
   document.getElementById('paste').onclick = async () => {
     try {
       const text = (await navigator.clipboard.readText()).trim();
       if (!text) { log('clipboard is empty'); return; }
       const normalized = text.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
-      document.getElementById('room').value = normalized;
-      log('pasted room id (' + normalized + ') from clipboard');
+      roomInput.value = normalized;
+      log('pasted room id (' + normalized + ')');
     } catch (e) {
-      log('clipboard read blocked (' + e.message + ') - paste manually with Ctrl+V');
+      log('clipboard read blocked (' + e.message + ')');
     }
   };
 
-  async function main() {
-    const room = document.getElementById('room').value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
-    document.getElementById('room').value = room;
+  async function startListening() {
+    const room = roomInput.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
+    roomInput.value = room;
     if (!/^[A-Z0-9]{6}$/.test(room)) {
-      throw new Error('Enter a valid 6-character room PIN (e.g. A1B2C3)');
+      throw new Error('Enter a valid 6-character room PIN');
     }
-    setStatus('connecting…');
-    log('join room ' + room);
+    setStatus('Connecting…');
+    log('joining room ' + room);
 
-    const device = new Device();
-
-    // --- signaling over the same origin as this page ---
-    const socketUrl = new URL('/gate2', location.href);
-    socketUrl.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    if (invite) socketUrl.searchParams.set('invite', invite);
-    const ws = new WebSocket(socketUrl);
-    const pending = new Map();
-    let nextId = 0;
-    ws.onmessage = (ev) => {
-      const msg = JSON.parse(ev.data);
-      if (msg.id && pending.has(msg.id)) { pending.get(msg.id)(msg); pending.delete(msg.id); }
-      else log('server: ' + msg.type);
-    };
-    const opened = new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
-    await opened;
-
-    const request = (type, data) => new Promise((resolve, reject) => {
-      const id = 'web-' + (nextId++);
-      pending.set(id, (msg) => {
-        if (msg.ok) resolve(msg.data);
-        else reject(new Error(type + ': ' + (msg.error ? msg.error.code + ' ' + msg.error.message : 'no error body')));
-      });
-      ws.send(JSON.stringify({ id, type, data }));
-    });
-
-    const joined = await request('JOIN_ROOM', { roomId: room });
-    log('joined room');
-    setStatus('joined - loading device…');
-
-    const { rtpCapabilities } = await request('GET_ROUTER_RTP_CAPABILITIES');
-    await device.load({ routerRtpCapabilities: rtpCapabilities });
-    log('device loaded, canProduceAudio=' + device.canProduce('audio'));
-
-    const t = await request('CREATE_WEBRTC_TRANSPORT', { direction: 'recv' });
-    const recv = device.createRecvTransport({
-      id: t.id, iceParameters: t.iceParameters, iceCandidates: t.iceCandidates, dtlsParameters: t.dtlsParameters,
-    });
-    recv.on('connect', ({ dtlsParameters }, cb, errback) =>
-      request('CONNECT_WEBRTC_TRANSPORT', { transportId: t.id, dtlsParameters })
-        .then(() => cb()).catch(errback));
-    log('recv transport created - waiting for producer…');
-
-    // If the producer is already live, the join response carried its id;
-    // otherwise wait for the PRODUCER_AVAILABLE notification.
-    const producerAvailable = new Promise((resolve) => {
-      if (joined.producerId) resolve(joined.producerId);
-      const handler = (ev) => {
-        const msg = JSON.parse(ev.data);
-        if (msg.type === 'PRODUCER_AVAILABLE') { ws.removeEventListener('message', handler); resolve(msg.data.producerId); }
-      };
-      ws.addEventListener('message', handler);
-    });
-    const producerId = await producerAvailable;
-    log('producer available: ' + String(producerId).slice(0, 8) + '…');
-    setStatus('producer found - consuming…');
-
-    // The app zod schema allows codec/ext kind fields, and mediasoup REQUIRES ext.kind
-    // ('audio'/'video') in validateAndNormalizeRtpHeaderExtension - stripping it made
-    // canConsume throw 'invalid ext.kind' (surfacing as N-CANNOT_CONSUME). Keep audio
-    // kinds explicit; drop video entries entirely.
-    const caps = JSON.parse(JSON.stringify(device.rtpCapabilities));
-    caps.codecs = caps.codecs.map(({ kind, ...c }) => c);
-    caps.headerExtensions = (caps.headerExtensions || [])
-      .filter((e) => !e.kind || e.kind === 'audio')
-      .map((e) => ({ kind: 'audio', ...e }));
-    // mediasoup matches audio codecs on channels EXACTLY; if the producer is mono (native
-    // libwebrtc wrappers often omit channels -> defaults to 1), stereo caps cannot consume it.
-    let info;
-    try {
-      info = await request('CONSUME', { transportId: t.id, producerId, rtpCapabilities: caps });
-    } catch (e) {
-      if (!/N-CANNOT_CONSUME/.test(String(e.message))) throw e;
-      const monoCaps = JSON.parse(JSON.stringify(caps));
-      monoCaps.codecs = monoCaps.codecs.map((c) => ({ ...c, channels: 1 }));
-      log('stereo caps rejected - retrying with mono channels:1');
-      info = await request('CONSUME', { transportId: t.id, producerId, rtpCapabilities: monoCaps });
-    }
-    const consumer = await recv.consume({
-      id: info.id, producerId: info.producerId, kind: info.kind,
-      rtpParameters: info.rtpParameters,
-    });
-    await request('RESUME_CONSUMER', { consumerId: consumer.id });
-    log('consumer resumed - attaching track…');
-
-    // Allow WebRTC's NetEQ jitter buffer to adapt smoothly with a gentle low-latency cushion (40ms)
-    // Avoid setting jitterBufferTarget to 0, which eradicates packet buffering and causes severe stutter/jitter over Wi-Fi.
-    if (consumer.rtpReceiver) {
-      if ('playoutDelayHint' in consumer.rtpReceiver) {
-        consumer.rtpReceiver.playoutDelayHint = 0.04; // 40ms cushion for smooth Wi-Fi playback
-      }
-    }
-
-    // Diagnostics: expose transport/consumer + poll RTP stats
-    window.__spike = { recv, consumer, device };
-    const statTimer = setInterval(async () => {
-      try {
-        const stats = await recv.getStats();
-        let bytes = -1, state = recv.connectionState, ice = null, lost = 0, jitter = 0;
-        stats.forEach((r) => {
-          if (r.type === 'inbound-rtp' && (r.kind === 'audio' || r.mediaType === 'audio')) {
-            bytes = r.bytesReceived;
-            lost = r.packetsLost || 0;
-            jitter = Math.round((r.jitter || 0) * 1000);
-          }
-          if (r.type === 'transport') ice = r.dtlsState + '/' + r.iceRole;
-        });
-        log(`stats: conn=${state} ice=${ice} bytes=${bytes} lost=${lost} jitter=${jitter}ms paused=${consumer.paused}`);
-      } catch (e) { log('stats err: ' + e.message); }
-    }, 3000);
-
-    const track = consumer.track;
-    if ('contentHint' in track) {
-      track.contentHint = 'music';
-    }
-    const stream = new MediaStream([track]);
-
-    // Direct hardware-accelerated audio playout (avoids mobile Web Audio thread scheduling jitter)
+    // Pre-create and prime audio element inside the user's Play gesture
     let audio = document.getElementById('remote-audio');
     if (!audio) {
       audio = document.createElement('audio');
@@ -212,23 +116,172 @@ const { Device } = mediasoupClient;
       audio.style.display = 'none';
       document.body.appendChild(audio);
     }
-    audio.srcObject = stream;
-    audio.playsInline = true;
 
-    const startPlayback = () => {
-      audio.play().then(() => {
-        log('audio playing via direct hardware pipeline (playsinline)');
-      }).catch((err) => {
-        log('autoplay deferred: tap screen to start audio (' + err.message + ')');
-      });
+    const socketUrl = new URL('/gate2', location.href);
+    socketUrl.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    if (invite) socketUrl.searchParams.set('invite', invite);
+
+    const ws = new WebSocket(socketUrl);
+    const pending = new Map();
+    let nextId = 0;
+    let statTimer = null;
+    let recv = null;
+    let closed = false;
+
+    const cleanup = () => {
+      if (closed) return;
+      closed = true;
+      if (statTimer) { clearInterval(statTimer); statTimer = null; }
+      for (const [, rejectReq] of pending) rejectReq(new Error('Connection closed'));
+      pending.clear();
+      try { recv?.close(); } catch {}
+      try { if (ws.readyState <= WebSocket.OPEN) ws.close(); } catch {}
+      playBtn.disabled = false;
     };
-    startPlayback();
-    window.addEventListener('click', startPlayback, { once: true });
-    window.addEventListener('touchstart', startPlayback, { once: true });
-    consumer.on('transportclose', () => setStatus('transport closed'));
 
-    setStatus('LISTENING - audio should be playing from laptop speakers');
-    log('LISTENING - if you hear the phone music, the spike PASSED');
+    const request = (type, data) => new Promise((resolve, reject) => {
+      if (ws.readyState !== WebSocket.OPEN) {
+        reject(new Error('Signaling connection is not open'));
+        return;
+      }
+      const id = 'web-' + (nextId++);
+      pending.set(id, (msg) => {
+        if (msg.ok) resolve(msg.data);
+        else reject(new Error(type + ': ' + (msg.error ? msg.error.code + ' ' + msg.error.message : 'no error body')));
+      });
+      ws.send(JSON.stringify({ id, type, data }));
+    });
+
+    const handleState = (data) => {
+      if (!data || !data.state) return;
+      const app = data.appLabel ? ` (${data.appLabel})` : '';
+      if (data.state === 'LIVE') setStatus(`LIVE — listening${app}`, 'live');
+      else if (data.state === 'PAUSED') setStatus(`Paused — Speaker paused${app}`);
+      else if (data.state === 'RECONNECTING') setStatus('Speaker reconnecting…');
+      else if (data.state === 'STOPPED') {
+        setStatus('Sharing ended', 'error');
+        cleanup();
+      }
+    };
+
+    await new Promise((resolve, reject) => {
+      let opened = false;
+      ws.onopen = () => { opened = true; resolve(); };
+      ws.onerror = () => {
+        if (!opened) reject(new Error('Invite expired, invalid, or stream is offline'));
+      };
+      ws.onclose = (ev) => {
+        if (!opened) reject(new Error('Invite expired, invalid, or stream is offline'));
+        else {
+          for (const [, cb] of pending) cb({ ok: false, error: { code: 'CLOSED', message: ev.reason || 'socket closed' } });
+          pending.clear();
+          cleanup();
+        }
+      };
+    });
+
+    ws.onmessage = (ev) => {
+      const msg = JSON.parse(ev.data);
+      if (msg.id && pending.has(msg.id)) {
+        const cb = pending.get(msg.id);
+        pending.delete(msg.id);
+        cb(msg);
+        return;
+      }
+      if (msg.type === 'STATE_UPDATE') handleState(msg.data);
+      else if (msg.type === 'PRODUCER_CLOSED') { setStatus('Sharing stopped', 'error'); cleanup(); }
+      else if (msg.type === 'ROOM_CLOSED') { setStatus('Room closed', 'error'); cleanup(); }
+      else log('server: ' + msg.type);
+    };
+
+    try {
+      const joined = await request('JOIN_ROOM', { roomId: room });
+      log('joined room');
+      setStatus('Loading audio stream…');
+
+      const device = new Device();
+      const { rtpCapabilities } = await request('GET_ROUTER_RTP_CAPABILITIES');
+      await device.load({ routerRtpCapabilities: rtpCapabilities });
+
+      const t = await request('CREATE_WEBRTC_TRANSPORT', { direction: 'recv' });
+      recv = device.createRecvTransport({
+        id: t.id, iceParameters: t.iceParameters, iceCandidates: t.iceCandidates, dtlsParameters: t.dtlsParameters,
+      });
+      recv.on('connect', ({ dtlsParameters }, cb, errback) =>
+        request('CONNECT_WEBRTC_TRANSPORT', { transportId: t.id, dtlsParameters })
+          .then(() => cb()).catch(errback));
+
+      const producerId = joined.producerId || await new Promise((resolve, reject) => {
+        const onMsg = (ev) => {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === 'PRODUCER_AVAILABLE') { ws.removeEventListener('message', onMsg); resolve(msg.data.producerId); }
+          else if (msg.type === 'ROOM_CLOSED') { ws.removeEventListener('message', onMsg); reject(new Error('Room closed')); }
+        };
+        ws.addEventListener('message', onMsg);
+      });
+      log('producer: ' + String(producerId).slice(0, 8) + '…');
+
+      const caps = JSON.parse(JSON.stringify(device.rtpCapabilities));
+      caps.codecs = caps.codecs.map(({ kind, ...c }) => c);
+      caps.headerExtensions = (caps.headerExtensions || [])
+        .filter((e) => !e.kind || e.kind === 'audio')
+        .map((e) => ({ kind: 'audio', ...e }));
+
+      let info;
+      try {
+        info = await request('CONSUME', { transportId: t.id, producerId, rtpCapabilities: caps });
+      } catch (e) {
+        if (!/N-CANNOT_CONSUME/.test(String(e.message))) throw e;
+        const monoCaps = JSON.parse(JSON.stringify(caps));
+        monoCaps.codecs = monoCaps.codecs.map((c) => ({ ...c, channels: 1 }));
+        log('retrying consume with mono');
+        info = await request('CONSUME', { transportId: t.id, producerId, rtpCapabilities: monoCaps });
+      }
+
+      const consumer = await recv.consume({
+        id: info.id, producerId: info.producerId, kind: info.kind,
+        rtpParameters: info.rtpParameters,
+      });
+      await request('RESUME_CONSUMER', { consumerId: consumer.id });
+
+      if (consumer.rtpReceiver && 'playoutDelayHint' in consumer.rtpReceiver) {
+        consumer.rtpReceiver.playoutDelayHint = 0.04;
+      }
+
+      statTimer = setInterval(async () => {
+        try {
+          const stats = await recv.getStats();
+          let bytes = -1, lost = 0, jitter = 0;
+          stats.forEach((r) => {
+            if (r.type === 'inbound-rtp' && (r.kind === 'audio' || r.mediaType === 'audio')) {
+              bytes = r.bytesReceived;
+              lost = r.packetsLost || 0;
+              jitter = Math.round((r.jitter || 0) * 1000);
+            }
+          });
+          log(`stats: conn=${recv.connectionState} bytes=${bytes} lost=${lost} jitter=${jitter}ms`);
+        } catch (e) { log('stats err: ' + e.message); }
+      }, 3000);
+
+      const track = consumer.track;
+      if ('contentHint' in track) track.contentHint = 'music';
+      audio.srcObject = new MediaStream([track]);
+      await audio.play();
+
+      if (joined.state) handleState(joined.state);
+      else setStatus('LIVE — listening', 'live');
+      log('audio playback started');
+
+      consumer.on('transportclose', () => {
+        setStatus('Connection closed', 'error');
+        cleanup();
+      });
+    } catch (e) {
+      cleanup();
+      throw e;
+    }
+
+    return { close: cleanup };
   }
 })();
 </script>

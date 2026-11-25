@@ -26,6 +26,8 @@ class SignalingException(
  */
 class Gate2SignalingClient(serverUrl: String) {
 
+    data class ListenerInvite(val url: String, val expiresAt: Long)
+
     private class PendingRequest {
         val latch = CountDownLatch(1)
         @Volatile var response: JSONObject? = null
@@ -215,6 +217,16 @@ class Gate2SignalingClient(serverUrl: String) {
             if (appLabel != null) put("appLabel", appLabel)
             if (reason != null) put("reason", reason)
         })
+
+    fun getListenerInvite(): ListenerInvite {
+        val data = request("GET_LISTENER_INVITE", JSONObject())
+        val url = data.optString("url", "")
+        val expiresAt = data.optLong("expiresAt", 0L)
+        check(url.isNotBlank() && expiresAt > 0L) {
+            "GET_LISTENER_INVITE returned an invalid invite payload"
+        }
+        return ListenerInvite(url = url, expiresAt = expiresAt)
+    }
 
     fun ping(timestamp: Double = System.currentTimeMillis().toDouble()): JSONObject =
         request("PING", JSONObject().apply {

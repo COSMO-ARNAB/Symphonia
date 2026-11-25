@@ -1,10 +1,11 @@
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { isIPv4 } from "node:net";
 import { networkInterfaces } from "node:os";
 import { MediasoupSfuFactory } from "./mediasoup-sfu.js";
 import { ProtocolFailure } from "./protocol.js";
 import { SignalingServer, type ConnectionPolicy, type ServerOptions } from "./server.js";
 import { SignalingService } from "./service.js";
+import { createListenerInvites } from "./listener-invites.js";
 
 const inviteLifetimeMs = 10 * 60_000;
 const roomPattern = /^[0-9A-Z]{6}$/;
@@ -26,7 +27,7 @@ export async function startPhoneRelay(ip: string, hostKey: string, signalPort = 
     heartbeatIntervalMs: 15_000, heartbeatTimeoutMs: 45_000,
   });
   const policies = createPhoneRelayPolicies(
-    hostKey, origin, roomId => service.debugRoomList().some(room => room.roomId === roomId && room.hasProducer)
+    hostKey, origin, roomId => service.listenerInviteScope(roomId)
   );
   const host = new SignalingServer(service, options(localhost, []), policies.host);
   const listener = new SignalingServer(service, options(ip, [origin]), policies.listener);
@@ -52,9 +53,12 @@ export async function startPhoneRelay(ip: string, hostKey: string, signalPort = 
   return close;
 }
 
-export function createPhoneRelayPolicies(hostKey: string, origin: string, ready: (roomId: string) => boolean) {
-  const signingKey = randomBytes(32);
-  const signature = (body: string) => createHmac("sha256", signingKey).update(body).digest("hex");
+export function createPhoneRelayPolicies(
+  hostKey: string,
+  origin: string,
+  currentScope: (roomId: string) => string | undefined,
+  invites = createListenerInvites(origin, randomBytes(32)),
+) {
   const deny = () => { throw new ProtocolFailure("N-FORBIDDEN", "Room invite required"); };
 
   const host: ConnectionPolicy = {
@@ -64,29 +68,26 @@ export function createPhoneRelayPolicies(hostKey: string, origin: string, ready:
     handleHttp(url, request, response) {
       if (url.pathname !== "/invite") return false;
       const roomId = url.searchParams.get("roomId") ?? "";
+      const scope = roomPattern.test(roomId) ? currentScope(roomId) : undefined;
       if (request.method !== "GET" || !matches(url.searchParams.get("hostKey"), hostKey)) {
         response.writeHead(403).end();
-      } else if (!roomPattern.test(roomId) || !ready(roomId)) {
+      } else if (!scope) {
         response.writeHead(404).end();
       } else {
-        const body = `${roomId}.${Date.now() + inviteLifetimeMs}`;
-        const inviteUrl = new URL("/listener.html", origin);
-        inviteUrl.searchParams.set("roomId", roomId);
-        inviteUrl.hash = new URLSearchParams({ invite: `${body}.${signature(body)}` }).toString();
-        response.writeHead(200, { "content-type": "text/plain", "cache-control": "no-store" }).end(inviteUrl.href);
+        const invite = invites.issue(roomId, scope, Date.now() + inviteLifetimeMs);
+        response.writeHead(200, { "content-type": "text/plain", "cache-control": "no-store" }).end(invite.url);
       }
       return true;
     },
   };
   const listener: ConnectionPolicy = {
     authorizeUpgrade(url) {
-      const [roomId, expires, mac, ...extra] = (url.searchParams.get("invite") ?? "").split(".");
-      if (!roomId || !expires || !mac || extra.length || !roomPattern.test(roomId) ||
-          !/^\d{13}$/.test(expires) || Date.now() >= Number(expires) ||
-          !matches(mac, signature(`${roomId}.${expires}`)) || !ready(roomId)) return undefined;
+      const invite = invites.verify(url.searchParams.get("invite"), currentScope);
+      if (!invite) return undefined;
       return request => {
-        if (request.type === "CREATE_ROOM" ||
-          (request.type === "JOIN_ROOM" && (request.data.roomId !== roomId || Date.now() >= Number(expires) || !ready(roomId)))) deny();
+        if (request.type === "CREATE_ROOM" || request.type === "GET_LISTENER_INVITE" ||
+          (request.type === "JOIN_ROOM" && (request.data.roomId !== invite.roomId ||
+            Date.now() >= invite.expiresAt || currentScope(invite.roomId) !== invite.scope))) deny();
       };
     },
   };

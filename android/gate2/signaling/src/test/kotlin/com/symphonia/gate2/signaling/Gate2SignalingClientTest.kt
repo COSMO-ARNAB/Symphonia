@@ -158,4 +158,34 @@ class Gate2SignalingClientTest {
         assertEquals("PRODUCER_AVAILABLE", receivedType)
         assertEquals("p-999", receivedProducerId)
     }
+
+    @Test
+    fun testGetListenerInviteParsesSignedUrlAndExpiry() {
+        val port = server!!.port
+        server!!.messageHandler = { conn, json ->
+            val id = json.getString("id")
+            if (json.getString("type") == "GET_LISTENER_INVITE") {
+                val res = JSONObject().apply {
+                    put("id", id)
+                    put("type", "RESPONSE")
+                    put("ok", true)
+                    put("data", JSONObject().apply {
+                        put("url", "https://203.0.113.10/listener.html?roomId=ROOM01#invite=ROOM01.1700000000000.abcd")
+                        put("expiresAt", 1700000000000L)
+                    })
+                }
+                conn.send(res.toString())
+            }
+        }
+
+        client = Gate2SignalingClient("ws://127.0.0.1:$port/gate2")
+        client!!.connectBlocking(5000)
+
+        val invite = client!!.getListenerInvite()
+        assertEquals(
+            "https://203.0.113.10/listener.html?roomId=ROOM01#invite=ROOM01.1700000000000.abcd",
+            invite.url
+        )
+        assertEquals(1700000000000L, invite.expiresAt)
+    }
 }

@@ -2,6 +2,7 @@ import { randomInt, randomUUID } from "node:crypto";
 import type { ClientRequest, ServerMessage } from "./protocol.js";
 import { ProtocolFailure } from "./protocol.js";
 import type { RoomSfu, SfuFactory } from "./sfu.js";
+import type { ListenerInvite } from "./listener-invites.js";
 
 export type Role = "HOST" | "SPEAKER" | "LISTENER";
 export interface ClientPeer { readonly connectionId: string; send(message: ServerMessage): void }
@@ -12,7 +13,7 @@ interface Room {
   sfu: RoomSfu;
   participants: Map<string, Participant>;
   hostId: string;
-  producer?: { id: string; participantId: string; generation: number };
+  producer?: { id: string; participantId: string; generation: number; inviteScope: string; startedAt: number; invite?: ListenerInvite };
   producing: boolean;
   state: { state: "LIVE" | "PAUSED" | "RECONNECTING" | "STOPPED"; appLabel?: string | null; reason?: string | null };
   pendingConsumers: number;
@@ -39,10 +40,31 @@ export class SignalingService {
     return id;
   }
 
-  constructor(private readonly sfuFactory: SfuFactory, private readonly sfuOperationTimeoutMs = DEFAULT_SFU_OPERATION_TIMEOUT_MS) {}
+  constructor(
+    private readonly sfuFactory: SfuFactory,
+    private readonly sfuOperationTimeoutMs = DEFAULT_SFU_OPERATION_TIMEOUT_MS,
+    private readonly inviteIssuer?: (roomId: string, scope: string, expiresAt: number) => ListenerInvite,
+  ) {}
+
+  listenerInviteScope(roomId: string): string | undefined {
+    const room = this.rooms.get(roomId);
+    return room?.state.state === "STOPPED" ? undefined : room?.producer?.inviteScope;
+  }
+
+  private getListenerInvite(peer: ClientPeer): ListenerInvite {
+    const { room, participant } = this.membership(peer);
+    const producer = room.producer;
+    if (!this.inviteIssuer || !producer || room.state.state === "STOPPED" || producer.participantId !== participant.id) {
+      throw new ProtocolFailure("N-FORBIDDEN", "An active Speaker is required to issue a listener invite");
+    }
+    const expiresAt = producer.startedAt + 24 * 60 * 60_000;
+    if (Date.now() >= expiresAt) throw new ProtocolFailure("N-FORBIDDEN", "Listener invite expired. Start a new share.");
+    return producer.invite ??= this.inviteIssuer(room.id, producer.inviteScope, expiresAt);
+  }
 
   async handle(peer: ClientPeer, request: ClientRequest): Promise<unknown> {
     switch (request.type) {
+      case "GET_LISTENER_INVITE": return this.getListenerInvite(peer);
       case "CREATE_ROOM": return this.createRoom(peer, request.data?.displayName);
       case "JOIN_ROOM": return this.joinRoom(peer, request.data.roomId, request.data.displayName);
       case "LEAVE_ROOM": this.leave(peer); return {};
@@ -168,7 +190,7 @@ export class SignalingService {
       const producer = await this.withSfuFailure((signal) => room.sfu.produce(participant.id, transportId, rtpParameters, appData, signal));
       if (!this.isCurrentMembership(peer, room, participant)) { room.sfu.closeParticipant(participant.id); throw new ProtocolFailure("N-NOT_IN_ROOM", "Connection closed before producer creation completed"); }
       if (producer.closed) throw new ProtocolFailure("N-SFU_FAILURE", "SFU resource closed during creation");
-      room.producer = { id: producer.id, participantId: participant.id, generation: producer.generation };
+      room.producer = { id: producer.id, participantId: participant.id, generation: producer.generation, inviteScope: randomUUID(), startedAt: Date.now() };
       this.broadcast(room, { type: "PRODUCER_AVAILABLE", data: { producerId: producer.id, participantId: participant.id } }, participant.id);
       return producer;
     } finally {
@@ -212,6 +234,10 @@ export class SignalingService {
   private updateState(peer: ClientPeer, state: Room["state"]) {
     const { room, participant } = this.membership(peer);
     if (!this.canPublish(participant)) throw new ProtocolFailure("N-FORBIDDEN", "Only the Host or Speaker may update sharing state");
+    if (state.state === "STOPPED" && room.producer) {
+      room.producer.inviteScope = randomUUID();
+      delete room.producer.invite;
+    }
     room.state = state;
     this.broadcast(room, { type: "STATE_UPDATE", data: state });
     return state;
