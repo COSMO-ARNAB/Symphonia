@@ -1,0 +1,12 @@
+table inet symphonia_demo {
+    chain input {
+        type filter hook input priority -10; policy accept;
+
+        tcp dport { 8080, 44444 } iifname != "wg0" drop
+        udp dport 44444 iifname != "wg0" drop
+        iifname "wg0" tcp dport { 8080, 44444 } ip saddr { 10.77.0.2, 10.77.0.3 } accept
+        iifname "wg0" udp dport 44444 ip saddr { 10.77.0.2, 10.77.0.3 } accept
+        tcp dport { 8080, 44444 } drop
+        udp dport 44444 drop
+    }
+}

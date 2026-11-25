@@ -58,8 +58,11 @@ class Gate2SignalingClient(serverUrl: String) {
             } else if (trimmed.startsWith("https://", ignoreCase = true)) {
                 trimmed = "wss://" + trimmed.substring(8)
             }
-            val pathAdded = if (trimmed.endsWith("/gate2")) trimmed else "$trimmed/gate2"
-            return URI(pathAdded)
+            val uri = URI(trimmed)
+            if (uri.path?.trimEnd('/')?.endsWith("/gate2") == true) {
+                return if (uri.path.endsWith('/')) URI(uri.scheme, uri.authority, uri.path.trimEnd('/'), uri.query, null) else uri
+            }
+            return URI(uri.scheme, uri.authority, "${uri.path.orEmpty().trimEnd('/')}/gate2", uri.query, null)
         }
     }
 
@@ -99,7 +102,7 @@ class Gate2SignalingClient(serverUrl: String) {
         close()
         val client = WebSocketImpl(requestUri)
         if (!client.connectBlocking(timeoutMs, TimeUnit.MILLISECONDS)) {
-            throw IllegalStateException("WebSocket connect timeout: $requestUri")
+            throw IllegalStateException("WebSocket connect timeout: ${requestUri.scheme}://${requestUri.host}:${requestUri.port}${requestUri.path}")
         }
         socket = client
     }

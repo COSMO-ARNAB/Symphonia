@@ -41,9 +41,21 @@ const { Device } = mediasoupClient;
   });
 
   const params = new URLSearchParams(window.location.search);
+  const invite = new URLSearchParams(location.hash.slice(1)).get('invite');
   const initialRoom = (params.get('roomId') || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
   if (initialRoom) {
     document.getElementById('room').value = initialRoom;
+    statusEl.innerHTML = `
+      <div style="background: #e7f5ea; border: 2px solid #28a745; border-radius: 8px; padding: 12px; margin: 10px 0; text-align: center;">
+        <div style="font-size: 16px; color: #155724; margin-bottom: 8px;"><strong>Room PIN: ${initialRoom}</strong> (Auto-detected from QR Code)</div>
+        <button id="qr-join" type="button" style="font-size: 18px; padding: 12px 24px; font-weight: bold; background: #28a745; color: #fff; border: none; border-radius: 6px; cursor: pointer; width: 100%;">
+          ▶ TAP HERE TO START LISTENING
+        </button>
+      </div>`;
+    document.getElementById('qr-join').onclick = () => {
+      document.getElementById('join').click();
+    };
+    // Attempt instant autoplay after short delay; if mobile browser requires a user gesture, the big green button above is ready
     setTimeout(() => { document.getElementById('join').click(); }, 300);
   }
 
@@ -76,7 +88,10 @@ const { Device } = mediasoupClient;
     const device = new Device();
 
     // --- signaling over the same origin as this page ---
-    const ws = new WebSocket(`ws://${location.host}/gate2`);
+    const socketUrl = new URL('/gate2', location.href);
+    socketUrl.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    if (invite) socketUrl.searchParams.set('invite', invite);
+    const ws = new WebSocket(socketUrl);
     const pending = new Map();
     let nextId = 0;
     ws.onmessage = (ev) => {
@@ -155,27 +170,29 @@ const { Device } = mediasoupClient;
     await request('RESUME_CONSUMER', { consumerId: consumer.id });
     log('consumer resumed - attaching track…');
 
-    // Low-latency jitter buffer configuration (strip artificial buffering)
+    // Allow WebRTC's NetEQ jitter buffer to adapt smoothly with a gentle low-latency cushion (40ms)
+    // Avoid setting jitterBufferTarget to 0, which eradicates packet buffering and causes severe stutter/jitter over Wi-Fi.
     if (consumer.rtpReceiver) {
       if ('playoutDelayHint' in consumer.rtpReceiver) {
-        consumer.rtpReceiver.playoutDelayHint = 0;
-      }
-      if ('jitterBufferTarget' in consumer.rtpReceiver) {
-        consumer.rtpReceiver.jitterBufferTarget = 0;
+        consumer.rtpReceiver.playoutDelayHint = 0.04; // 40ms cushion for smooth Wi-Fi playback
       }
     }
 
-    // THROWAWAY spike diagnostics: expose transport/consumer + poll RTP stats
+    // Diagnostics: expose transport/consumer + poll RTP stats
     window.__spike = { recv, consumer, device };
     const statTimer = setInterval(async () => {
       try {
         const stats = await recv.getStats();
-        let bytes = -1, state = recv.connectionState, ice = null;
+        let bytes = -1, state = recv.connectionState, ice = null, lost = 0, jitter = 0;
         stats.forEach((r) => {
-          if (r.type === 'inbound-rtp' && (r.kind === 'audio' || r.mediaType === 'audio')) bytes = r.bytesReceived;
+          if (r.type === 'inbound-rtp' && (r.kind === 'audio' || r.mediaType === 'audio')) {
+            bytes = r.bytesReceived;
+            lost = r.packetsLost || 0;
+            jitter = Math.round((r.jitter || 0) * 1000);
+          }
           if (r.type === 'transport') ice = r.dtlsState + '/' + r.iceRole;
         });
-        log(`stats: conn=${state} ice=${ice} bytesReceived=${bytes} paused=${consumer.paused} prodPaused=${consumer.producerPaused} muted=${consumer.track.muted}`);
+        log(`stats: conn=${state} ice=${ice} bytes=${bytes} lost=${lost} jitter=${jitter}ms paused=${consumer.paused}`);
       } catch (e) { log('stats err: ' + e.message); }
     }, 3000);
 
@@ -185,30 +202,29 @@ const { Device } = mediasoupClient;
     }
     const stream = new MediaStream([track]);
 
-    // Low-latency Web Audio output pipeline
-    try {
-      const AudioCtx = window.AudioContext || window.webkitAudioContext;
-      const audioCtx = new AudioCtx({ latencyHint: 'interactive', sampleRate: 48000 });
-      if (audioCtx.state === 'suspended') {
-        await audioCtx.resume();
-      }
-      const source = audioCtx.createMediaStreamSource(stream);
-      source.connect(audioCtx.destination);
-      log('audio connected to low-latency Web Audio graph (latencyHint: interactive)');
-
-      // Keep muted fallback audio element to maintain active media stream pull in Chrome
-      const dummyAudio = document.createElement('audio');
-      dummyAudio.srcObject = stream;
-      dummyAudio.muted = true;
-      dummyAudio.play().catch(() => {});
-    } catch (e) {
-      log('Web Audio failed (' + e.message + ') - falling back to HTMLAudioElement');
-      const audio = document.createElement('audio');
-      audio.srcObject = stream;
+    // Direct hardware-accelerated audio playout (avoids mobile Web Audio thread scheduling jitter)
+    let audio = document.getElementById('remote-audio');
+    if (!audio) {
+      audio = document.createElement('audio');
+      audio.id = 'remote-audio';
       audio.autoplay = true;
+      audio.playsInline = true;
+      audio.style.display = 'none';
       document.body.appendChild(audio);
-      try { await audio.play(); } catch (err) { log('autoplay blocked (' + err.message + ')'); }
     }
+    audio.srcObject = stream;
+    audio.playsInline = true;
+
+    const startPlayback = () => {
+      audio.play().then(() => {
+        log('audio playing via direct hardware pipeline (playsinline)');
+      }).catch((err) => {
+        log('autoplay deferred: tap screen to start audio (' + err.message + ')');
+      });
+    };
+    startPlayback();
+    window.addEventListener('click', startPlayback, { once: true });
+    window.addEventListener('touchstart', startPlayback, { once: true });
     consumer.on('transportclose', () => setStatus('transport closed'));
 
     setStatus('LISTENING - audio should be playing from laptop speakers');

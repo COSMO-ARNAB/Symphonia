@@ -1,0 +1,12 @@
+[Interface]
+Address = 10.77.0.1/24
+ListenPort = 51820
+PrivateKey = <server-private-key>
+
+[Peer]
+PublicKey = <speaker-public-key>
+AllowedIPs = 10.77.0.2/32
+
+[Peer]
+PublicKey = <listener-public-key>
+AllowedIPs = 10.77.0.3/32

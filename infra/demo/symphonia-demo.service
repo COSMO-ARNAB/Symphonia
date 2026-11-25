@@ -1,0 +1,25 @@
+[Unit]
+Description=Symphonia private cross-network demo
+Requires=wg-quick@wg0.service
+After=wg-quick@wg0.service
+
+[Service]
+Type=simple
+User=symphonia
+Group=symphonia
+WorkingDirectory=/opt/symphonia/signaling
+Environment=HOST=10.77.0.1
+Environment=PORT=8080
+Environment=UNSAFE_ALLOW_REMOTE=true
+Environment=WEBRTC_LISTEN_IP=10.77.0.1
+Environment=ANNOUNCED_ADDRESS=10.77.0.1
+Environment=WEBRTC_PORT=44444
+ExecStart=/usr/bin/node dist/src/index.js
+Restart=on-failure
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

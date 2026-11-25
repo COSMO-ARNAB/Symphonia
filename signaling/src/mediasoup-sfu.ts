@@ -18,7 +18,8 @@ const mediaCodecs = [{
   }
 }];
 
-export interface MediasoupSfuOptions { listenIp: string; announcedAddress?: string; port: number }
+interface MediaEndpoint { listenIp: string; announcedAddress?: string; port: number }
+export interface MediasoupSfuOptions extends MediaEndpoint { additionalEndpoint?: MediaEndpoint }
 
 export class MediasoupSfuFactory implements SfuFactory {
   private constructor(private readonly worker: Worker, private readonly webRtcServer: WebRtcServer) {}
@@ -30,12 +31,13 @@ export class MediasoupSfuFactory implements SfuFactory {
       setTimeout(() => process.exit(1), 2_000).unref();
     });
     const webRtcServer = await worker.createWebRtcServer({
-      listenInfos: ["udp", "tcp"].map((protocol) => ({
-        protocol: protocol as "udp" | "tcp",
-        ip: options.listenIp,
-        port: options.port,
-        ...(options.announcedAddress === undefined ? {} : { announcedAddress: options.announcedAddress })
-      }))
+      listenInfos: [options, ...(options.additionalEndpoint ? [options.additionalEndpoint] : [])]
+        .flatMap(endpoint => (["udp", "tcp"] as const).map(protocol => ({
+          protocol,
+          ip: endpoint.listenIp,
+          port: endpoint.port,
+          ...(endpoint.announcedAddress === undefined ? {} : { announcedAddress: endpoint.announcedAddress })
+        })))
     });
     return new MediasoupSfuFactory(worker, webRtcServer);
   }

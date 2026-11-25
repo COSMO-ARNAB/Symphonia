@@ -1,0 +1,13 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application android:networkSecurityConfig="@xml/gate2_probe_network_security">
+        <activity
+            android:name=".Gate2RelayProbeActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:exported="false"
+            android:process=":relayProbe" />
+        <service
+            android:name=".Gate2PhoneRelayService"
+            android:exported="false"
+            android:process=":phoneRelay" />
+    </application>
+</manifest>

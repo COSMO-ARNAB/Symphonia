@@ -3,7 +3,21 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+val relayProbeBundle = providers.gradleProperty("gate2RelayProbeBundle").orNull
+
 android {
+    if (relayProbeBundle != null) {
+        val bundle = file(relayProbeBundle)
+        require(bundle.resolve("assets/probe.zip").isFile) { "Missing relay probe assets" }
+        for (library in listOf("libnode.so", "libc++_shared.so", "librelay_probe.so", "libmediasoup_worker.so")) {
+            require(bundle.resolve("jniLibs/arm64-v8a/$library").isFile) { "Missing relay probe library: $library" }
+        }
+        sourceSets.getByName("debug") {
+            assets.srcDir(bundle.resolve("assets"))
+            jniLibs.srcDir(bundle.resolve("jniLibs"))
+        }
+        packaging.jniLibs.useLegacyPackaging = true
+    }
     namespace = "com.symphonia.gate2.prototype.harness"
     compileSdk = 34
 
@@ -67,6 +81,9 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.7.0")
+
+    // QR Code Generation (Lightweight pure-Java)
+    implementation("com.google.zxing:core:3.5.3")
 
     // Testing
     testImplementation("junit:junit:4.13.2")

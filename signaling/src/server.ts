@@ -1,14 +1,19 @@
-import { createServer, type Server as HttpServer } from "node:http";
-import { readFile } from "node:fs";
+import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from "node:http";
+import { existsSync, readFile } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { WebSocket, WebSocketServer } from "ws";
 import { ZodError } from "zod";
-import { ProtocolFailure, requestSchema, type ServerMessage } from "./protocol.js";
+import { ProtocolFailure, requestSchema, type ClientRequest, type ServerMessage } from "./protocol.js";
 import { SignalingService, type ClientPeer } from "./service.js";
 import { assertSafeHost } from "./config.js";
 
-interface LiveSocket extends WebSocket { lastPongAt: number; pendingRequests: number; requestQueue: Promise<void> }
+interface LiveSocket extends WebSocket { authorize?: (request: ClientRequest) => void; lastPongAt: number; pendingRequests: number; requestQueue: Promise<void> }
 export interface ServerOptions { host: string; port: number; unsafeAllowRemote: boolean; allowedOrigins: string[]; heartbeatIntervalMs: number; heartbeatTimeoutMs: number }
+
+export interface ConnectionPolicy {
+  authorizeUpgrade(url: URL): ((request: ClientRequest) => void) | undefined;
+  handleHttp?(url: URL, request: IncomingMessage, response: ServerResponse): boolean;
+}
 
 const MAX_CONNECTIONS = 64;
 const MAX_PENDING_REQUESTS = 32;
@@ -20,18 +25,30 @@ export class SignalingServer {
   private readonly wss: WebSocketServer;
   private heartbeat?: NodeJS.Timeout;
 
-  constructor(private readonly service: SignalingService, private readonly options: ServerOptions) {
+  constructor(
+    private readonly service: SignalingService,
+    private readonly options: ServerOptions,
+    private readonly policy?: ConnectionPolicy,
+  ) {
     assertSafeHost(options.host, options.unsafeAllowRemote);
     this.http = createServer((request, response) => {
-      if (request.url === "/healthz") { response.writeHead(200, { "content-type": "application/json" }); response.end('{"status":"ok"}'); return; }
+      const parsedUrl = parseRequestUrl(request.url);
+      if (!parsedUrl) { response.writeHead(400).end(); return; }
+      if (this.policy?.handleHttp?.(parsedUrl, request, response)) return;
+      const pathname = parsedUrl.pathname;
+      if (pathname === "/healthz") { response.writeHead(200, { "content-type": "application/json" }); response.end('{"status":"ok"}'); return; }
       // THROWAWAY spike diagnostic (local-only rig, never expose): list live rooms.
-      if (request.url === "/debug/rooms") {
+      if (!this.policy && pathname === "/debug/rooms") {
         response.writeHead(200, { "content-type": "application/json" });
         response.end(JSON.stringify({ rooms: this.service.debugRoomList() }));
         return;
       }
-      if (request.url === "/" || request.url === "/listener.html" || request.url === "/index.html") {
-        const pagePath = new URL("../public/listener.html", import.meta.url);
+      const resolveStaticPath = (rel: string): URL => {
+        const rootCandidate = new URL(`../../public/${rel}`, import.meta.url);
+        return existsSync(rootCandidate) ? rootCandidate : new URL(`../public/${rel}`, import.meta.url);
+      };
+      if (pathname === "/" || pathname === "/listener.html" || pathname === "/index.html") {
+        const pagePath = resolveStaticPath("listener.html");
         readFile(pagePath, (error, content) => {
           if (error) { response.writeHead(404).end(); return; }
           response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
@@ -39,8 +56,8 @@ export class SignalingServer {
         });
         return;
       }
-      if (request.url === "/mediasoup-client.esm.js") {
-        const jsPath = new URL("../public/mediasoup-client.esm.js", import.meta.url);
+      if (pathname === "/mediasoup-client.esm.js") {
+        const jsPath = resolveStaticPath("mediasoup-client.esm.js");
         readFile(jsPath, (error, content) => {
           if (error) { response.writeHead(404).end(); return; }
           response.writeHead(200, { "content-type": "text/javascript; charset=utf-8" });
@@ -53,12 +70,17 @@ export class SignalingServer {
     this.wss = new WebSocketServer({ noServer: true, maxPayload: MAX_PAYLOAD_BYTES, perMessageDeflate: false });
     this.http.on("upgrade", (request, socket, head) => {
       const origin = request.headers.origin;
-      if (request.url !== "/gate2" || (origin !== undefined && !this.options.allowedOrigins.includes(origin)) || this.wss.clients.size >= MAX_CONNECTIONS) {
+      const parsedUrl = parseRequestUrl(request.url);
+      const authorize = parsedUrl && this.policy?.authorizeUpgrade(parsedUrl);
+      if (!parsedUrl || (this.policy && !authorize) || parsedUrl.pathname !== "/gate2" || (origin !== undefined && !this.options.allowedOrigins.includes(origin)) || this.wss.clients.size >= MAX_CONNECTIONS) {
         socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
         socket.destroy();
         return;
       }
-      this.wss.handleUpgrade(request, socket, head, (client) => this.wss.emit("connection", client, request));
+      this.wss.handleUpgrade(request, socket, head, (client) => {
+        if (authorize) (client as LiveSocket).authorize = authorize;
+        this.wss.emit("connection", client, request);
+      });
     });
     this.wss.on("connection", (socket: LiveSocket) => this.onConnection(socket));
   }
@@ -69,12 +91,12 @@ export class SignalingServer {
     this.heartbeat.unref();
   }
 
-  async close(): Promise<void> {
+  async close(closeService = true): Promise<void> {
     if (this.heartbeat) clearInterval(this.heartbeat);
     for (const client of this.wss.clients) client.terminate();
     await new Promise<void>((resolve) => this.wss.close(() => resolve()));
     await new Promise<void>((resolve) => this.http.close(() => resolve()));
-    await this.service.close();
+    if (closeService) await this.service.close();
   }
 
   get port(): number { return (this.http.address() as AddressInfo | null)?.port ?? this.options.port; }
@@ -105,6 +127,7 @@ export class SignalingServer {
     const requestId = typeof raw === "object" && raw !== null && "id" in raw && typeof raw.id === "string" ? raw.id : null;
     try {
       const request = requestSchema.parse(raw);
+      socket.authorize?.(request);
       const data = await this.service.handle(peer, request);
       this.send(socket, { id: request.id, type: "RESPONSE", ok: true, data });
     } catch (error) {
@@ -122,4 +145,9 @@ export class SignalingServer {
     socket.send(payload);
   }
   private checkHeartbeats() { const now = Date.now(); for (const socket of this.wss.clients as Set<LiveSocket>) { if (now - socket.lastPongAt > this.options.heartbeatTimeoutMs) socket.terminate(); else socket.ping(); } }
+}
+
+function parseRequestUrl(raw: string | undefined): URL | undefined {
+  try { return new URL(raw || "/", "http://localhost"); }
+  catch { return undefined; }
 }

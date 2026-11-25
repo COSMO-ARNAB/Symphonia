@@ -365,6 +365,17 @@ class Gate2CaptureController(
     }
 
     /**
+     * Fast-path telemetry recording for WebRTC SamplesReadyCallback.
+     * Records offered frame counter without allocating ShortArray/ByteBuffer or churning queues
+     * on WebRTC's real-time audio thread.
+     */
+    fun onSampleChunkOffered() {
+        if (capturingFlag) {
+            totalOfferedFrames++
+        }
+    }
+
+    /**
      * Poll for WebRTC injection path (Step 3). Returns null if empty.
      */
     fun pollForInjection(): PcmFrame? = queue.poll()

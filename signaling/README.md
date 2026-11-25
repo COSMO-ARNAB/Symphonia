@@ -4,6 +4,8 @@ Minimal Node/TypeScript WebSocket signaling and mediasoup SFU prototype for one 
 
 > **Local prototype only:** authentication and signed room tokens (`SignedRoomToken`) are intentionally not implemented for this Gate 2 exercise. Rooms use 6-character uppercase alphanumeric PIN codes (`[0-9A-Z]`) generated with zero cryptographic bias (`randomInt` + `.charAt()`) with collision protection. In production, manual PIN entry requires server-side rate-limiting on failed `JOIN_ROOM` attempts (`N-ROOM_NOT_FOUND`), and invite links use signed cryptographic tokens. Do not expose this unthrottled, unauthenticated service to the public internet.
 
+The instructions below run the existing laptop-backed prototype. The first product milestone is an offline, laptop-free QR flow with the Speaker phone hosting the browser player, signaling, and SFU. The ARM64 Gate 2 debug bundle runs that stack on the Speaker phone. The user confirmed the offline second-phone QR test passed on 2026-11-25. See [ADR-004](../docs/DECISION.md#adr-004-offline-local-sharing-first).
+
 ## Guarantees and scope
 
 - Audio-only mediasoup router: Opus, 48 kHz, stereo, in-band FEC.

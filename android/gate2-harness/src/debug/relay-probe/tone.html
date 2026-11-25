@@ -1,0 +1,36 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Symphonia tone probe</title>
+<button id="listen">Play test tone</button>
+<p id="status"></p>
+<audio id="audio" controls></audio>
+<script type="module">
+const base = location.pathname;
+const { default: { Device } } = await import(base + '/client.js');
+const button = document.querySelector('#listen');
+const status = document.querySelector('#status');
+const player = document.querySelector('#audio');
+async function rpc(type, fields = {}) {
+  const result = await fetch(base + '/rpc', { method: 'POST', body: JSON.stringify({type, ...fields}) });
+  if (!result.ok) throw new Error('Request failed (' + type + ', ' + result.status + ')');
+  return result.json();
+}
+button.onclick = async () => {
+  button.disabled = true;
+  try {
+    const device = new Device();
+    await device.load({ routerRtpCapabilities: await rpc('caps') });
+    const transport = device.createRecvTransport(await rpc('transport'));
+    transport.on('connect', ({dtlsParameters}, ok, fail) => rpc('connect', {parameters:dtlsParameters}).then(ok, fail));
+    const consumer = await transport.consume(await rpc('consume', {capabilities:device.rtpCapabilities}));
+    player.srcObject = new MediaStream([consumer.track]);
+    await rpc('resume');
+    player.play().catch(() => {});
+    setInterval(async () => {
+      for (const stat of (await consumer.getStats()).values()) {
+        if (stat.type === 'inbound-rtp') status.textContent = 'Audio bytes received: ' + stat.bytesReceived;
+      }
+    }, 1000);
+  } catch (error) { status.textContent = error.message; }
+};
+</script>

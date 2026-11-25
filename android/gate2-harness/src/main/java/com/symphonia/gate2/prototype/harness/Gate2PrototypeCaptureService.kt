@@ -58,6 +58,7 @@ class Gate2PrototypeCaptureService : Service() {
         const val EXTRA_TARGET_APP_LABEL = "extra_target_app_label"
         const val EXTRA_ROOM_ID = "extra_room_id"
         const val EXTRA_SERVER_URL = "extra_server_url"
+        const val EXTRA_RELAY_ADDRESS = "extra_relay_address"
         const val ACTION_STOP_CAPTURE = "com.symphonia.gate2.prototype.harness.ACTION_STOP_CAPTURE"
 
         private fun createStopIntent(context: Context): Intent =
@@ -83,7 +84,8 @@ class Gate2PrototypeCaptureService : Service() {
     var sessionStartTimeMs: Long = 0L
         private set
 
-    var speakerTransport: MediasoupSpeakerTransport? = null
+    @Volatile private var phoneRelay: Gate2PhoneRelay? = null
+    @Volatile var speakerTransport: MediasoupSpeakerTransport? = null
         private set
 
     lateinit var captureController: Gate2CaptureController
@@ -99,6 +101,10 @@ class Gate2PrototypeCaptureService : Service() {
         private set
     private val _currentRoomId = MutableStateFlow<String?>(null)
     val currentRoomId: StateFlow<String?> = _currentRoomId.asStateFlow()
+    private val _listenerInvite = MutableStateFlow<String?>(null)
+    val listenerInvite = _listenerInvite.asStateFlow()
+    val usesPhoneRelay: Boolean get() = Gate2PhoneRelay.isAvailable(this)
+
     var serverUrl: String = "ws://10.0.2.2:3000/gate2"
         private set
 
@@ -140,6 +146,7 @@ class Gate2PrototypeCaptureService : Service() {
             return START_NOT_STICKY
         }
 
+        if (speakerTransport != null || phoneRelay != null) return START_NOT_STICKY
         val resultData: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             intent?.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
         } else {
@@ -160,7 +167,7 @@ class Gate2PrototypeCaptureService : Service() {
             } else {
                 telemetry.markCaptureRequested()
                 startForegroundWithNotification(isCapturing = true)
-                initAudioCapture(resultData, targetUid)
+                initAudioCapture(resultData, targetUid, intent?.getStringExtra(EXTRA_RELAY_ADDRESS))
             }
         } else {
             Log.e(TAG, "Fail-closed: missing MediaProjection or targetUid=$targetUid [G2-CAP-02]")
@@ -174,7 +181,7 @@ class Gate2PrototypeCaptureService : Service() {
         return START_NOT_STICKY
     }
 
-    private fun initAudioCapture(resultData: Intent, targetUid: Int) {
+    private fun initAudioCapture(resultData: Intent, targetUid: Int, relayAddress: String?) {
         val pm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         try {
             mediaProjection = pm.getMediaProjection(Activity.RESULT_OK, resultData)
@@ -221,26 +228,32 @@ class Gate2PrototypeCaptureService : Service() {
             stopGate2Capture(ShareStoppedReason.HOST_ENDED)
         }
         speakerTransport = transport
+        val relay = if (usesPhoneRelay) Gate2PhoneRelay(applicationContext, relayAddress) {
+            if (speakerTransport === transport) stopGate2Capture(ShareStoppedReason.HOST_ENDED)
+        } else null
+        phoneRelay = relay
 
         Thread({
             try {
+                relay?.bind()
+                val endpoint = relay?.awaitReady() ?: serverUrl
+                if (speakerTransport !== transport) return@Thread
                 val createdRoomId = transport.start(
-                    serverUrl = serverUrl,
+                    serverUrl = endpoint,
                     mediaProjection = proj,
                     targetUid = targetUid,
                     appLabel = targetAppLabel,
-                    onSamplesReady = { data, sampleRate, channelCount ->
-                        captureController.onPcmCaptured(
-                            data = data,
-                            sampleRateHz = sampleRate,
-                            channelCount = channelCount,
-                            capturedAtNanos = SystemClock.elapsedRealtimeNanos()
-                        )
-                        // Drain queue so it doesn't overflow when monitoring via SamplesReadyCallback
-                        captureController.drainQueue()
+                    onSamplesReady = { _, _, _ ->
+                        captureController.onSampleChunkOffered()
                     }
                 )
+                val invite = relay?.invite(createdRoomId)
+                if (speakerTransport !== transport) {
+                    transport.close()
+                    return@Thread
+                }
                 roomIdForNotification = createdRoomId
+                _listenerInvite.value = invite
                 _currentRoomId.value = createdRoomId
                 isCapturingAtomic.set(true)
                 sessionStartTimeMs = SystemClock.elapsedRealtime()
@@ -250,6 +263,7 @@ class Gate2PrototypeCaptureService : Service() {
                 registerVolumeReceiver()
                 Log.i(TAG, "Speaker send path live in room: $createdRoomId")
             } catch (t: Throwable) {
+                if (speakerTransport !== transport) return@Thread
                 Log.e(TAG, "Failed to start WebRTC speaker session", t)
                 captureController.onCaptureUnavailable(Gate2Failure.MEDIA_TRANSPORT_UNAVAILABLE)
                 telemetry.recordFailure("G2-NET-01")
@@ -402,8 +416,13 @@ class Gate2PrototypeCaptureService : Service() {
         try { mediaProjection?.stop() } catch (_: Exception) {}
         mediaProjection = null
 
-        speakerTransport?.close()
+        val transport = speakerTransport
         speakerTransport = null
+        transport?.close()
+        val relay = phoneRelay
+        phoneRelay = null
+        relay?.close()
+        _listenerInvite.value = null
         roomIdForNotification = "No Room"
         _currentRoomId.value = null
 
